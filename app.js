@@ -520,7 +520,7 @@ function createRobotArm() {
 
     // Initial position - upright ready stance
     // Arm reaching up and forward with gripper pointing outward
-    setJointAngles(0, -20, 90, 45, false);
+    setJointAngles(180, -20, 90, 45, false);
 
     // Initialize gripper position (50% open)
     applyGripperOpenness();
@@ -1258,7 +1258,7 @@ function handleGotoCommand(args) {
 function handleHomeCommand() {
     terminal.print('Moving to home position (ready stance)...', 'success');
     // Return to the starting "ready" position
-    setJointAngles(0, -20, 90, 45);
+    setJointAngles(180, -20, 90, 45);
     // Reset wrist rotation
     targetAngles.wristRotate = 0;
 }
@@ -1415,7 +1415,7 @@ function showLimits() {
 
 // Preset positions - realistic robot arm poses
 const PRESETS = {
-    home: { base: 0, shoulder: -20, elbow: 90, wrist: 45, rotate: 0, desc: 'Home/ready stance (default)' },
+    home: { base: 180, shoulder: -20, elbow: 90, wrist: 45, rotate: 0, desc: 'Home/ready stance (default)' },
     upright: { base: 0, shoulder: 0, elbow: 0, wrist: 0, rotate: 0, desc: 'Fully upright (all zeros)' },
     rest: { base: 0, shoulder: 70, elbow: 110, wrist: -60, rotate: 0, desc: 'Folded rest position' },
     reach: { base: 0, shoulder: 50, elbow: 30, wrist: 10, rotate: 0, desc: 'Forward reach' },

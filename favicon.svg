@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Base -->
+  <rect x="10" y="26" width="12" height="4" rx="1" fill="#4a5568"/>
+
+  <!-- Base column -->
+  <rect x="13" y="22" width="6" height="5" fill="#4a5568"/>
+
+  <!-- Shoulder joint -->
+  <circle cx="16" cy="21" r="3" fill="#63b3ed"/>
+
+  <!-- Upper arm -->
+  <rect x="14" y="12" width="4" height="10" rx="1" fill="#718096"/>
+
+  <!-- Elbow joint -->
+  <circle cx="16" cy="11" r="2.5" fill="#63b3ed"/>
+
+  <!-- Lower arm (angled) -->
+  <rect x="14" y="4" width="3.5" height="8" rx="1" fill="#90cdf4" transform="rotate(15 16 8)"/>
+
+  <!-- Wrist joint -->
+  <circle cx="18" cy="4" r="2" fill="#63b3ed"/>
+
+  <!-- Gripper -->
+  <rect x="16" y="1" width="2" height="4" fill="#f56565"/>
+  <rect x="19" y="1" width="2" height="4" fill="#f56565"/>
+</svg>

@@ -627,17 +627,50 @@ function createObject(type, x, y, z, sizeMm = 80) {
     return physicsObj;
 }
 
-function removeObject(obj) {
+function removeObject(obj, instant = false) {
     const index = sceneObjects.indexOf(obj);
-    if (index > -1) {
+    if (index === -1) return;
+
+    // If gripped, release it first
+    if (grippedObject === obj) {
+        grippedObject = null;
+    }
+
+    // Remove from array immediately to prevent double-removal
+    sceneObjects.splice(index, 1);
+
+    if (instant) {
+        // Instant removal (no animation)
         scene.remove(obj.mesh);
         obj.mesh.geometry.dispose();
         obj.mesh.material.dispose();
-        sceneObjects.splice(index, 1);
-        if (grippedObject === obj) {
-            grippedObject = null;
+        return;
+    }
+
+    // Shrink to zero animation
+    const duration = 300; // ms
+    const startTime = performance.now();
+
+    function animateShrink() {
+        const elapsed = performance.now() - startTime;
+        const progress = Math.min(elapsed / duration, 1);
+
+        // Ease in curve for accelerating shrink
+        const eased = progress * progress;
+        const scale = 1 - eased;
+        obj.mesh.scale.set(scale, scale, scale);
+
+        if (progress < 1) {
+            requestAnimationFrame(animateShrink);
+        } else {
+            // Animation complete - remove from scene
+            scene.remove(obj.mesh);
+            obj.mesh.geometry.dispose();
+            obj.mesh.material.dispose();
         }
     }
+
+    animateShrink();
 }
 
 function removeAllObjects() {
@@ -675,6 +708,211 @@ function getGripperCenter() {
     return center;
 }
 
+// Get world positions of all arm joint points for collision detection
+function getArmJointPositions() {
+    // Update all world matrices
+    robotArm.basePivot.updateWorldMatrix(true, true);
+
+    const positions = [];
+
+    // Base position (top of base)
+    const basePos = new THREE.Vector3();
+    robotArm.basePivot.getWorldPosition(basePos);
+    basePos.y += CONFIG.segments.baseHeight;
+    positions.push({ name: 'shoulder', pos: basePos.clone() });
+
+    // Elbow position
+    const elbowPos = new THREE.Vector3();
+    robotArm.elbowPivot.getWorldPosition(elbowPos);
+    positions.push({ name: 'elbow', pos: elbowPos.clone() });
+
+    // Wrist position
+    const wristPos = new THREE.Vector3();
+    robotArm.wristPivot.getWorldPosition(wristPos);
+    positions.push({ name: 'wrist', pos: wristPos.clone() });
+
+    // Gripper base position
+    const gripperBasePos = new THREE.Vector3();
+    robotArm.wristRotatePivot.getWorldPosition(gripperBasePos);
+    positions.push({ name: 'gripperBase', pos: gripperBasePos.clone() });
+
+    // Gripper tips
+    const tips = getGripperFingerTips();
+    positions.push({ name: 'leftTip', pos: tips.left.clone() });
+    positions.push({ name: 'rightTip', pos: tips.right.clone() });
+
+    // Gripper center
+    const gripperCenter = getGripperCenter();
+    positions.push({ name: 'gripperCenter', pos: gripperCenter.clone() });
+
+    return positions;
+}
+
+// Check distance from a point to a line segment
+function pointToSegmentDistance(point, segStart, segEnd) {
+    const line = segEnd.clone().sub(segStart);
+    const len = line.length();
+    if (len < 0.001) return point.distanceTo(segStart);
+
+    line.normalize();
+    const toPoint = point.clone().sub(segStart);
+    const proj = toPoint.dot(line);
+
+    if (proj <= 0) return point.distanceTo(segStart);
+    if (proj >= len) return point.distanceTo(segEnd);
+
+    const closestPoint = segStart.clone().add(line.multiplyScalar(proj));
+    return point.distanceTo(closestPoint);
+}
+
+// Check if any part of the arm collides with an object
+// Returns collision info for physics response
+function checkArmObjectCollision(obj) {
+    const positions = getArmJointPositions();
+    const objPos = obj.mesh.position;
+    const radius = obj.getRadius();
+
+    // Arm segment radii (approximate thickness of each segment)
+    const segmentRadii = {
+        upperArm: 0.08,    // Upper arm thickness
+        lowerArm: 0.06,    // Lower arm thickness
+        wrist: 0.05,       // Wrist thickness
+        gripper: 0.04      // Gripper thickness
+    };
+
+    // Define arm segments to check
+    const segments = [
+        { start: 'shoulder', end: 'elbow', radius: segmentRadii.upperArm, name: 'upper arm' },
+        { start: 'elbow', end: 'wrist', radius: segmentRadii.lowerArm, name: 'lower arm' },
+        { start: 'wrist', end: 'gripperBase', radius: segmentRadii.wrist, name: 'wrist' },
+        { start: 'gripperBase', end: 'gripperCenter', radius: segmentRadii.gripper, name: 'gripper' }
+    ];
+
+    // Create position lookup
+    const posLookup = {};
+    for (const p of positions) {
+        posLookup[p.name] = p.pos;
+    }
+
+    let closestDist = Infinity;
+    let closestSegment = null;
+    let collisionPoint = null;
+
+    // Check each segment
+    for (const seg of segments) {
+        const startPos = posLookup[seg.start];
+        const endPos = posLookup[seg.end];
+        if (!startPos || !endPos) continue;
+
+        const dist = pointToSegmentDistance(objPos, startPos, endPos);
+        const collisionThreshold = radius + seg.radius;
+
+        if (dist < collisionThreshold && dist < closestDist) {
+            closestDist = dist;
+            closestSegment = seg;
+            // Calculate approximate collision point on segment
+            const segCenter = startPos.clone().add(endPos).multiplyScalar(0.5);
+            collisionPoint = segCenter;
+        }
+    }
+
+    // Also check individual joint points (the spherical joints)
+    const jointRadii = { elbow: 0.2, wrist: 0.15 };
+    for (const [jointName, jointRadius] of Object.entries(jointRadii)) {
+        const jointPos = posLookup[jointName];
+        if (!jointPos) continue;
+
+        const dist = jointPos.distanceTo(objPos);
+        const collisionThreshold = radius + jointRadius;
+
+        if (dist < collisionThreshold && dist < closestDist) {
+            closestDist = dist;
+            closestSegment = { name: jointName + ' joint', radius: jointRadius };
+            collisionPoint = jointPos.clone();
+        }
+    }
+
+    if (closestSegment) {
+        return {
+            collision: true,
+            distance: closestDist,
+            segment: closestSegment,
+            point: collisionPoint,
+            penetration: (radius + closestSegment.radius) - closestDist
+        };
+    }
+
+    return { collision: false };
+}
+
+// Check if arm is colliding with a blocked object (can't be pushed)
+// Returns { collision: bool, object: obj } if arm should stop
+function checkArmCollisionWithBlockedObject() {
+    for (const obj of sceneObjects) {
+        if (obj.isGripped) continue;
+
+        const collision = checkArmObjectCollision(obj);
+        if (!collision.collision) continue;
+
+        const objPos = obj.mesh.position;
+        const halfHeight = obj.getHalfHeight();
+
+        // Check if object is on the floor
+        const onFloor = objPos.y <= halfHeight + 0.01;
+
+        // Check if we're pushing from above (collision point is above object center)
+        const pushingFromAbove = collision.point && collision.point.y > objPos.y + halfHeight * 0.5;
+
+        // If on floor and being pushed from above, it's blocked
+        if (onFloor && pushingFromAbove && collision.penetration > 0.02) {
+            return { collision: true, object: obj, info: collision };
+        }
+
+        // If significantly penetrating a floor object, also stop
+        if (onFloor && collision.penetration > obj.getRadius() * 0.3) {
+            return { collision: true, object: obj, info: collision };
+        }
+    }
+
+    return { collision: false, object: null };
+}
+
+// Push objects that the arm is colliding with (from the side)
+function pushObjectsFromArm() {
+    for (const obj of sceneObjects) {
+        if (obj.isGripped) continue;
+
+        const collision = checkArmObjectCollision(obj);
+        if (!collision.collision) continue;
+        if (collision.penetration < 0.005) continue;  // Small threshold
+
+        const objPos = obj.mesh.position;
+        const halfHeight = obj.getHalfHeight();
+        const onFloor = objPos.y <= halfHeight + 0.01;
+
+        // Calculate push direction (away from collision point)
+        if (collision.point) {
+            const pushDir = objPos.clone().sub(collision.point);
+
+            // If on floor, don't push down
+            if (onFloor) {
+                pushDir.y = Math.max(0, pushDir.y);
+            }
+
+            if (pushDir.length() > 0.001) {
+                pushDir.normalize();
+
+                // Push strength based on penetration
+                const pushStrength = Math.min(collision.penetration * 2, 0.05);
+                obj.mesh.position.add(pushDir.clone().multiplyScalar(pushStrength));
+
+                // Add velocity
+                obj.velocity.add(pushDir.clone().multiplyScalar(0.5));
+            }
+        }
+    }
+}
+
 function checkGripperContact(obj) {
     const tips = getGripperFingerTips();
     const objPos = obj.mesh.position;
@@ -696,26 +934,134 @@ function checkGripperContact(obj) {
     };
 }
 
-function applyGripperPush(obj, contact) {
-    if (obj.isGripped) return;
-
-    const tips = getGripperFingerTips();
+// Check collision between gripper finger surfaces and object
+// Returns collision info including minimum openness to avoid penetration
+function checkGripperFingerCollision(obj) {
     const objPos = obj.mesh.position;
+    const radius = obj.getRadius();
+    const halfHeight = obj.getHalfHeight();
+
+    // Get gripper group world transform
+    robotArm.gripperGroup.updateWorldMatrix(true, false);
+
+    // Get gripper center (at finger tips)
+    const gripperCenter = getGripperCenter();
+
+    // Get gripper's local axes in world space
+    const gripperXAxis = new THREE.Vector3(1, 0, 0);
+    const gripperYAxis = new THREE.Vector3(0, 1, 0);
+    const gripperZAxis = new THREE.Vector3(0, 0, 1);
+    gripperXAxis.applyQuaternion(robotArm.gripperGroup.getWorldQuaternion(new THREE.Quaternion()));
+    gripperYAxis.applyQuaternion(robotArm.gripperGroup.getWorldQuaternion(new THREE.Quaternion()));
+    gripperZAxis.applyQuaternion(robotArm.gripperGroup.getWorldQuaternion(new THREE.Quaternion()));
+
+    // Position of object relative to gripper center, projected onto gripper axes
+    const relPos = objPos.clone().sub(gripperCenter);
+    const objX = relPos.dot(gripperXAxis);  // Left-right in gripper space
+    const objY = relPos.dot(gripperYAxis);  // Along finger length (negative = toward base)
+    const objZ = relPos.dot(gripperZAxis);  // Forward-back
+
+    // Gripper geometry constants
+    const clampLength = CONFIG.segments.gripperLength;
+    const clampDepth = 0.08;
+    const padInnerOffset = 0.03;  // Distance from finger center to inner pad surface
+    const minOffset = 0.02;
+    const maxOffset = 0.12;
+
+    // Current finger positions
+    const currentOffset = minOffset + (maxOffset - minOffset) * (gripperOpenness / 100);
+    const leftFingerInnerX = -currentOffset + padInnerOffset;   // Left finger inner surface X
+    const rightFingerInnerX = currentOffset - padInnerOffset;   // Right finger inner surface X
+
+    // Object edges in gripper X space
+    const objLeftEdge = objX - radius;
+    const objRightEdge = objX + radius;
+
+    // Check if object is within grippable region
+    // Y range: finger tips at 0, base at -clampLength (negative direction)
+    const objTopY = objY - halfHeight;
+    const objBottomY = objY + halfHeight;
+    const inYRange = objBottomY > -clampLength && objTopY < 0;
+
+    // Z range: object must be within gripper depth
+    const inZRange = Math.abs(objZ) < (clampDepth / 2 + radius);
+
+    // X range: check if object is within the gripper's potential closing path
+    // Use the maximum finger span (fully open) to check if object could ever be gripped
+    const maxLeftFingerInnerX = -maxOffset + padInnerOffset;   // Left finger at max open
+    const maxRightFingerInnerX = maxOffset - padInnerOffset;   // Right finger at max open
+
+    // Object must be within the maximum gripper span to be considered
+    const inXRange = objLeftEdge < maxRightFingerInnerX && objRightEdge > maxLeftFingerInnerX;
+
+    if (!inYRange || !inZRange || !inXRange) {
+        return {
+            collision: false,
+            minOpenness: 0,
+            leftContact: false,
+            rightContact: false,
+            bothContact: false
+        };
+    }
+
+    // Calculate minimum openness to avoid penetrating this object
+    // Left finger needs: -offset + padInnerOffset <= objLeftEdge
+    //   => offset >= padInnerOffset - objLeftEdge
+    // Right finger needs: offset - padInnerOffset >= objRightEdge
+    //   => offset >= objRightEdge + padInnerOffset
+
+    const requiredOffsetForLeft = padInnerOffset - objLeftEdge;
+    const requiredOffsetForRight = objRightEdge + padInnerOffset;
+    const requiredOffset = Math.max(requiredOffsetForLeft, requiredOffsetForRight);
+
+    // Convert to openness percentage
+    // Clamp between 0-100
+    let minOpenness = (requiredOffset - minOffset) / (maxOffset - minOffset) * 100;
+    minOpenness = Math.max(0, Math.min(100, minOpenness));
+
+    // Contact detection with tolerance
+    const contactThreshold = 0.008;
+
+    // Left finger contacts when its inner surface reaches the object's left edge
+    const leftContact = leftFingerInnerX >= objLeftEdge - contactThreshold &&
+                        leftFingerInnerX <= objRightEdge + contactThreshold;
+
+    // Right finger contacts when its inner surface reaches the object's right edge
+    const rightContact = rightFingerInnerX <= objRightEdge + contactThreshold &&
+                         rightFingerInnerX >= objLeftEdge - contactThreshold;
+
+    return {
+        collision: minOpenness > gripperOpenness,  // Only collision if we'd need to be more open
+        minOpenness: minOpenness,
+        leftContact: leftContact,
+        rightContact: rightContact,
+        bothContact: leftContact && rightContact
+    };
+}
+
+function applyGripperPush(obj, collision) {
+    if (obj.isGripped) return;
+    // Only push if there's single-finger contact (not gripping from both sides)
+    if (!collision.leftContact && !collision.rightContact) return;
+    if (collision.bothContact) return;  // Both fingers touching = gripping, not pushing
+
+    // Get gripper's local X axis in world space for push direction
+    robotArm.gripperGroup.updateWorldMatrix(true, false);
+    const gripperXAxis = new THREE.Vector3(1, 0, 0);
+    gripperXAxis.applyQuaternion(robotArm.gripperGroup.getWorldQuaternion(new THREE.Quaternion()));
 
     // If only one finger touching, push away from that finger
-    if (contact.leftContact && !contact.rightContact) {
-        const pushDir = objPos.clone().sub(tips.left).normalize();
-        pushDir.y = 0;  // Keep push horizontal
-        obj.mesh.position.add(pushDir.multiplyScalar(0.015));
-        obj.velocity.x = pushDir.x * 0.5;
-        obj.velocity.z = pushDir.z * 0.5;
+    if (collision.leftContact && !collision.rightContact) {
+        // Push in positive X direction (away from left finger)
+        const pushDir = gripperXAxis.clone();
+        obj.mesh.position.add(pushDir.multiplyScalar(0.01));
+        obj.velocity.add(gripperXAxis.clone().multiplyScalar(0.3));
     }
-    if (contact.rightContact && !contact.leftContact) {
-        const pushDir = objPos.clone().sub(tips.right).normalize();
-        pushDir.y = 0;
-        obj.mesh.position.add(pushDir.multiplyScalar(0.015));
-        obj.velocity.x = pushDir.x * 0.5;
-        obj.velocity.z = pushDir.z * 0.5;
+    if (collision.rightContact && !collision.leftContact) {
+        // Push in negative X direction (away from right finger)
+        const pushDir = gripperXAxis.clone().negate();
+        obj.mesh.position.add(pushDir.multiplyScalar(0.01));
+        obj.velocity.add(gripperXAxis.clone().multiplyScalar(-0.3));
     }
 }
 
@@ -725,14 +1071,18 @@ function gripObject(obj) {
     obj.isGripped = true;
     grippedObject = obj;
 
-    // Store offset from gripper center
+    // Get gripper world position and rotation
     const gripperCenter = getGripperCenter();
-    obj.grippedOffset = obj.mesh.position.clone().sub(gripperCenter);
-
-    // Store rotation relative to gripper
     const gripperQuat = new THREE.Quaternion();
     robotArm.gripperGroup.getWorldQuaternion(gripperQuat);
     const gripperQuatInv = gripperQuat.clone().invert();
+
+    // Store offset in gripper's LOCAL coordinate system
+    // This way the offset transforms correctly when the gripper rotates
+    const worldOffset = obj.mesh.position.clone().sub(gripperCenter);
+    obj.grippedOffset = worldOffset.applyQuaternion(gripperQuatInv);
+
+    // Store rotation relative to gripper
     obj.grippedRotation = obj.mesh.quaternion.clone().premultiply(gripperQuatInv);
 
     // Stop any velocity
@@ -800,10 +1150,29 @@ function updatePhysics(deltaTime) {
                 if (Math.abs(obj.velocity.z) < 0.001) obj.velocity.z = 0;
             }
 
-            // Check for gripper contact (push physics)
-            const contact = checkGripperContact(obj);
-            if (contact.leftContact || contact.rightContact) {
-                applyGripperPush(obj, contact);
+            // Check for gripper finger collision (push physics for gripping)
+            const gripperCollision = checkGripperFingerCollision(obj);
+            if (gripperCollision.leftContact || gripperCollision.rightContact) {
+                applyGripperPush(obj, gripperCollision);
+            }
+
+            // Check for arm segment collision (push objects away from arm)
+            const armCollision = checkArmObjectCollision(obj);
+            if (armCollision.collision && armCollision.penetration > 0.005) {
+                const objPos = obj.mesh.position;
+                const onFloor = objPos.y <= halfHeight + 0.01;
+
+                if (armCollision.point) {
+                    const pushDir = objPos.clone().sub(armCollision.point);
+                    if (onFloor) pushDir.y = Math.max(0, pushDir.y);
+
+                    if (pushDir.length() > 0.001) {
+                        pushDir.normalize();
+                        const pushStrength = Math.min(armCollision.penetration, 0.02);
+                        obj.mesh.position.add(pushDir.clone().multiplyScalar(pushStrength));
+                        obj.velocity.add(pushDir.clone().multiplyScalar(0.2));
+                    }
+                }
             }
         }
     }
@@ -942,13 +1311,16 @@ function solveIK(targetX, targetY, targetZ, maxIterations = 50) {
     const wristH = h + L3;               // Height of wrist relative to shoulder
     const wristDist = Math.sqrt(wristR * wristR + wristH * wristH);
 
-    // Check reachability
+    // Check reachability - too far
     if (wristDist > armReach * 0.98) {
         return { success: false, error: `Target too far (need ${(wristDist * 100).toFixed(0)}cm, arm reach: ${(armReach * 100).toFixed(0)}cm)` };
     }
 
-    if (wristDist < 0.1) {
-        return { success: false, error: 'Target is too close to base' };
+    // Check if target is essentially at the shoulder pivot (can't reach directly above/below self)
+    // This is a geometric singularity - use a small threshold based on arm geometry
+    const minWristDist = 0.02;  // 2cm - very close to shoulder pivot
+    if (wristDist < minWristDist) {
+        return { success: false, error: 'Target is too close to shoulder pivot' };
     }
 
     // Solve 2-link IK using law of cosines
@@ -1008,7 +1380,13 @@ function solveIK(targetX, targetY, targetZ, maxIterations = 50) {
     }
 
     if (configs.length === 0) {
-        return { success: false, error: 'Cannot reach target with gripper pointing down (joint limits)' };
+        // Calculate horizontal distance for more helpful error
+        const horizontalDist = (r * 100).toFixed(0);
+        const heightFromFloor = (targetZ * 100).toFixed(0);
+        return {
+            success: false,
+            error: `Cannot reach (${horizontalDist}cm out, ${heightFromFloor}cm up) with gripper pointing down - try a different height or distance`
+        };
     }
 
     // Prefer elbow-down for reaching forward/down, elbow-up for reaching up/back
@@ -1045,6 +1423,9 @@ function startAnimation() {
 function updateAnimation() {
     if (!isAnimating) return;
 
+    // Store previous angles in case we need to revert
+    const prevAngles = { ...jointAngles };
+
     const elapsed = performance.now() - animationStartTime;
     const progress = Math.min(elapsed / CONFIG.animation.duration, 1);
     const easedProgress = easingFunctions[CONFIG.animation.easing](progress);
@@ -1058,6 +1439,33 @@ function updateAnimation() {
     jointAngles.wristRotate = lerpAngle(animationStartAngles.wristRotate, targetAngles.wristRotate, easedProgress);
 
     applyJointAngles();
+
+    // Push any objects the arm is colliding with (if they can move)
+    pushObjectsFromArm();
+
+    // Check for collision with blocked objects (that couldn't be pushed)
+    const collisionCheck = checkArmCollisionWithBlockedObject();
+    if (collisionCheck.collision) {
+        // Revert to previous safe position
+        jointAngles.base = prevAngles.base;
+        jointAngles.shoulder = prevAngles.shoulder;
+        jointAngles.elbow = prevAngles.elbow;
+        jointAngles.wrist = prevAngles.wrist;
+        jointAngles.wristRotate = prevAngles.wristRotate;
+        applyJointAngles();
+
+        // Stop animation
+        isAnimating = false;
+        document.getElementById('status-animating').classList.remove('active');
+
+        // Clear the command queue to prevent further movement
+        animationQueue.length = 0;
+
+        // Print error
+        terminal.print(`COLLISION: Arm stopped - cannot push through ${collisionCheck.object.name}`, 'error');
+        terminal.print('Object is blocked and cannot be moved. Reposition the arm.', 'warning');
+        return;
+    }
 
     if (progress >= 1) {
         isAnimating = false;
@@ -1083,14 +1491,22 @@ function updateGripperAnimation() {
 
     // Check for grip/release based on direction
     if (isClosing && !grippedObject) {
-        // Check if we're about to grip an object
+        // Check for collision with objects along full finger surface
         for (const obj of sceneObjects) {
             if (obj.isGripped) continue;
-            const contact = checkGripperContact(obj);
-            if (contact.bothContact) {
+            const collision = checkGripperFingerCollision(obj);
+
+            // Check if closing to target would penetrate this object
+            if (collision.minOpenness > 0 && targetGripperOpenness < collision.minOpenness) {
+                // Clamp target to minimum openness that doesn't penetrate
+                targetGripperOpenness = collision.minOpenness;
+            }
+
+            // Check if both fingers are now contacting the object
+            if (collision.bothContact) {
                 // Both fingers touching - grip the object!
                 gripObject(obj);
-                // Stop closing - gripper stays at current position
+                // Stop at current position
                 targetGripperOpenness = gripperOpenness;
                 gripperAnimating = false;
                 applyGripperOpenness();
@@ -1102,13 +1518,16 @@ function updateGripperAnimation() {
         releaseObject();
     }
 
-    if (Math.abs(diff) < 0.3) {
+    // Recalculate diff after potential target adjustment
+    const newDiff = targetGripperOpenness - gripperOpenness;
+
+    if (Math.abs(newDiff) < 0.3) {
         // Close enough, snap to target
         gripperOpenness = targetGripperOpenness;
         gripperAnimating = false;
     } else {
         // Smooth interpolation
-        gripperOpenness += diff * speed;
+        gripperOpenness += newDiff * speed;
     }
 
     applyGripperOpenness();
@@ -1982,8 +2401,61 @@ const savedPositions = {};
 
 // User programs (scripts)
 const programs = {};
+window.programs = programs; // Expose globally for notebook access
 let programMode = null;  // null or { name: string, commands: [] }
 let runningProgram = null;  // null or { name, commands, index, loopStack, paused }
+
+// Built-in demo program
+const builtInScripts = {
+    demo: {
+        content: `# Demo script - pick and place demonstration
+spawn cube 100 100 0 120mm
+spawn sphere 100 -100 0 120mm
+spawn cylinder -100 100 0 120mm
+g 100 100 50
+r 45
+grip 100
+g 100 100 0
+grip 0
+g 100 100 50
+g 200 100 50
+g 200 100 10
+grip 100
+g 200 100 50
+g 100 -100 50
+g 100 -100 0
+grip 0
+g 100 -100 50
+g 100 200 50
+g 100 200 10
+grip 100
+g 100 200 50
+g -100 100 50
+g -100 100 0
+grip 0
+g -100 100 50
+g 150 150 50
+g 150 150 10
+grip 100
+g 150 150 50
+home
+wait 1000
+remove all`,
+        builtIn: true
+    }
+};
+
+// Register built-in programs
+for (const name in builtInScripts) {
+    const script = builtInScripts[name];
+    const lines = script.content.split('\n')
+        .map(l => l.trim())
+        .filter(l => l && !l.startsWith('#'));
+    programs[name] = {
+        commands: lines,
+        created: 'built-in'
+    };
+}
 
 function handlePresetCommand(args) {
     if (args.length < 1) {
@@ -2332,6 +2804,7 @@ function handleDeletePositionCommand(args) {
     delete savedPositions[name];
     terminal.print(`Position "${name}" deleted.`, 'success');
 }
+
 
 // ============================================================================
 // PROGRAM/SCRIPT SYSTEM
@@ -3006,9 +3479,21 @@ const notebook = {
         tab.savedName = name;
         tab.modified = false;
 
+        const content = this.editor.value;
+        const lines = content.split('\n')
+            .map(l => l.trim())
+            .filter(l => l && !l.startsWith('#'));
+
         this.savedScripts[name] = {
-            content: this.editor.value,
+            content: content,
             savedAt: new Date().toISOString()
+        };
+
+        // Also register as a terminal program (lowercase for terminal compatibility)
+        const programName = name.toLowerCase();
+        window.programs[programName] = {
+            commands: lines,
+            created: new Date().toISOString()
         };
 
         this.saveToStorage();
@@ -3016,7 +3501,7 @@ const notebook = {
         this.updateStatus();
         this.hideSave();
 
-        terminal.print(`Script "${name}" saved.`, 'success');
+        terminal.print(`Script "${name}" saved. Use 'run ${name}' in terminal.`, 'success');
     },
 
     showLoad() {
@@ -3025,33 +3510,52 @@ const notebook = {
 
         list.innerHTML = '';
 
-        const names = Object.keys(this.savedScripts);
-        if (names.length === 0) {
-            list.innerHTML = '<div style="padding: 16px; color: #8b949e; text-align: center;">No saved scripts</div>';
-        } else {
-            for (const name of names) {
-                const script = this.savedScripts[name];
-                const date = new Date(script.savedAt).toLocaleDateString();
+        // Add built-in scripts first
+        for (const name in builtInScripts) {
+            const script = builtInScripts[name];
+            const item = document.createElement('div');
+            item.className = 'saved-script-item';
+            item.innerHTML = `
+                <div>
+                    <div class="script-name">${name}</div>
+                    <div class="script-date" style="color: #7ee787;">built-in</div>
+                </div>
+            `;
+            item.onclick = () => {
+                this.load(name, true);
+                this.hideLoad();
+            };
+            list.appendChild(item);
+        }
 
-                const item = document.createElement('div');
-                item.className = 'saved-script-item';
-                item.innerHTML = `
-                    <div>
-                        <div class="script-name">${name}</div>
-                        <div class="script-date">${date}</div>
-                    </div>
-                    <button class="script-delete" onclick="notebook.deleteScript('${name}', event)" title="Delete">
-                        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
-                    </button>
-                `;
-                item.onclick = (e) => {
-                    if (!e.target.closest('.script-delete')) {
-                        this.load(name);
-                        this.hideLoad();
-                    }
-                };
-                list.appendChild(item);
-            }
+        // Add user-saved scripts
+        const names = Object.keys(this.savedScripts);
+        for (const name of names) {
+            const script = this.savedScripts[name];
+            const date = new Date(script.savedAt).toLocaleDateString();
+
+            const item = document.createElement('div');
+            item.className = 'saved-script-item';
+            item.innerHTML = `
+                <div>
+                    <div class="script-name">${name}</div>
+                    <div class="script-date">${date}</div>
+                </div>
+                <button class="script-delete" onclick="notebook.deleteScript('${name}', event)" title="Delete">
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                </button>
+            `;
+            item.onclick = (e) => {
+                if (!e.target.closest('.script-delete')) {
+                    this.load(name);
+                    this.hideLoad();
+                }
+            };
+            list.appendChild(item);
+        }
+
+        if (Object.keys(builtInScripts).length === 0 && names.length === 0) {
+            list.innerHTML = '<div style="padding: 16px; color: #8b949e; text-align: center;">No saved scripts</div>';
         }
 
         dialog.classList.add('open');
@@ -3061,8 +3565,8 @@ const notebook = {
         document.getElementById('load-dialog').classList.remove('open');
     },
 
-    load(name) {
-        const script = this.savedScripts[name];
+    load(name, isBuiltIn = false) {
+        const script = isBuiltIn ? builtInScripts[name] : this.savedScripts[name];
         if (!script) return;
 
         // Check if already open in a tab
@@ -3105,6 +3609,18 @@ const notebook = {
             const data = localStorage.getItem('robotarm_scripts');
             if (data) {
                 this.savedScripts = JSON.parse(data);
+                // Register all saved scripts as terminal programs (lowercase for terminal compatibility)
+                for (const name in this.savedScripts) {
+                    const script = this.savedScripts[name];
+                    const lines = script.content.split('\n')
+                        .map(l => l.trim())
+                        .filter(l => l && !l.startsWith('#'));
+                    const programName = name.toLowerCase();
+                    window.programs[programName] = {
+                        commands: lines,
+                        created: script.savedAt
+                    };
+                }
             }
         } catch (e) {
             console.error('Failed to load from localStorage:', e);
@@ -3169,5 +3685,37 @@ document.addEventListener('DOMContentLoaded', () => {
     // Click anywhere on terminal panel to focus input
     document.getElementById('terminal-panel').addEventListener('click', () => {
         document.getElementById('terminal-input').focus();
+    });
+
+    // Terminal panel resize
+    const terminalPanel = document.getElementById('terminal-panel');
+    const resizeHandle = document.getElementById('terminal-resize-handle');
+    const canvasContainer = document.getElementById('canvas-container');
+    let isResizing = false;
+
+    resizeHandle.addEventListener('mousedown', (e) => {
+        isResizing = true;
+        document.body.style.cursor = 'ew-resize';
+        document.body.style.userSelect = 'none';
+        canvasContainer.style.pointerEvents = 'none'; // Prevent canvas from stealing events
+        e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!isResizing) return;
+        const newWidth = window.innerWidth - e.clientX;
+        const clampedWidth = Math.max(400, Math.min(800, newWidth));
+        terminalPanel.style.width = clampedWidth + 'px';
+        onWindowResize(); // Update Three.js canvas size
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (isResizing) {
+            isResizing = false;
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+            canvasContainer.style.pointerEvents = ''; // Re-enable canvas events
+            onWindowResize(); // Final resize update
+        }
     });
 });

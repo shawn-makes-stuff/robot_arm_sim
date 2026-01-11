@@ -55,6 +55,7 @@ let isAnimating = false;
 let animationQueue = [];
 let commandHistory = [];
 let historyIndex = -1;
+let multiLineBuffer = [];  // Buffer for multi-line input with Shift+Enter
 
 // Current joint angles (in radians)
 const jointAngles = {
@@ -78,6 +79,49 @@ const targetAngles = {
 let gripperOpenness = 50;  // Start half open
 let targetGripperOpenness = 50;
 let gripperAnimating = false;
+
+// ============================================================================
+// PHYSICS OBJECTS
+// ============================================================================
+
+const sceneObjects = [];  // Array of physics objects
+let grippedObject = null; // Currently gripped object
+let lastFrameTime = performance.now();
+
+class PhysicsObject {
+    constructor(mesh, type, size, name) {
+        this.mesh = mesh;
+        this.type = type;
+        this.size = size;  // { x, y, z } bounding dimensions
+        this.name = name;
+        this.velocity = new THREE.Vector3(0, 0, 0);
+        this.isGripped = false;
+        this.grippedOffset = null;  // Offset from gripper when gripped
+        this.grippedRotation = null; // Rotation relative to gripper when gripped
+    }
+
+    getRadius() {
+        return Math.max(this.size.x, this.size.z) / 2;
+    }
+
+    getHalfHeight() {
+        return this.size.y / 2;
+    }
+}
+
+// Object colors for variety
+const OBJECT_COLORS = [
+    0xe53e3e, // red
+    0xdd6b20, // orange
+    0xd69e2e, // yellow
+    0x38a169, // green
+    0x3182ce, // blue
+    0x805ad5, // purple
+    0xd53f8c, // pink
+    0x319795  // teal
+];
+
+let objectCounter = 0;
 
 // ============================================================================
 // EASING FUNCTIONS
@@ -527,6 +571,245 @@ function createRobotArm() {
 }
 
 // ============================================================================
+// PHYSICS OBJECTS - CREATION AND MANAGEMENT
+// ============================================================================
+
+function createObject(type, x, y, z, sizeMm = 80) {
+    // x, y, z are in robotics coordinates (cm): X=left/right, Y=forward, Z=height
+    // Convert to Three.js coordinates (meters): X=same, Y=height, Z=forward
+    const posX = x / 100;  // cm to meters
+    const posY = z / 100;  // Z (height) becomes Y in Three.js
+    const posZ = y / 100;  // Y (forward) becomes Z in Three.js
+
+    let geometry, size;
+    const objectSize = sizeMm / 1000;  // Convert mm to meters
+
+    switch (type) {
+        case 'cylinder':
+            geometry = new THREE.CylinderGeometry(objectSize / 2, objectSize / 2, objectSize, 16);
+            size = { x: objectSize, y: objectSize, z: objectSize };
+            break;
+        case 'sphere':
+            geometry = new THREE.SphereGeometry(objectSize / 2, 16, 16);
+            size = { x: objectSize, y: objectSize, z: objectSize };
+            break;
+        case 'cube':
+        default:
+            geometry = new THREE.BoxGeometry(objectSize, objectSize, objectSize);
+            size = { x: objectSize, y: objectSize, z: objectSize };
+            type = 'cube';
+            break;
+    }
+
+    const color = OBJECT_COLORS[objectCounter % OBJECT_COLORS.length];
+    const material = new THREE.MeshStandardMaterial({
+        color: color,
+        roughness: 0.4,
+        metalness: 0.3
+    });
+
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+
+    // Position the object (ensure it's above floor)
+    const halfHeight = size.y / 2;
+    mesh.position.set(posX, Math.max(posY, halfHeight), posZ);
+
+    scene.add(mesh);
+
+    objectCounter++;
+    const name = `${type}_${objectCounter}`;
+
+    const physicsObj = new PhysicsObject(mesh, type, size, name);
+    sceneObjects.push(physicsObj);
+
+    return physicsObj;
+}
+
+function removeObject(obj) {
+    const index = sceneObjects.indexOf(obj);
+    if (index > -1) {
+        scene.remove(obj.mesh);
+        obj.mesh.geometry.dispose();
+        obj.mesh.material.dispose();
+        sceneObjects.splice(index, 1);
+        if (grippedObject === obj) {
+            grippedObject = null;
+        }
+    }
+}
+
+function removeAllObjects() {
+    while (sceneObjects.length > 0) {
+        removeObject(sceneObjects[0]);
+    }
+    objectCounter = 0;
+}
+
+// ============================================================================
+// PHYSICS UPDATE
+// ============================================================================
+
+function getGripperFingerTips() {
+    // Update world matrices
+    robotArm.leftFinger.updateWorldMatrix(true, false);
+    robotArm.rightFinger.updateWorldMatrix(true, false);
+
+    // Create points at finger tip positions (local y = gripperLength)
+    const tipY = CONFIG.segments.gripperLength;
+
+    const leftTip = new THREE.Vector3(0, tipY, 0);
+    const rightTip = new THREE.Vector3(0, tipY, 0);
+
+    robotArm.leftFinger.localToWorld(leftTip);
+    robotArm.rightFinger.localToWorld(rightTip);
+
+    return { left: leftTip, right: rightTip };
+}
+
+function getGripperCenter() {
+    robotArm.endEffectorMarker.updateWorldMatrix(true, false);
+    const center = new THREE.Vector3();
+    robotArm.endEffectorMarker.getWorldPosition(center);
+    return center;
+}
+
+function checkGripperContact(obj) {
+    const tips = getGripperFingerTips();
+    const objPos = obj.mesh.position;
+    const radius = obj.getRadius();
+
+    // Distance from each finger tip to object center
+    const leftDist = tips.left.distanceTo(objPos);
+    const rightDist = tips.right.distanceTo(objPos);
+
+    // Contact threshold: object radius + finger pad width
+    const contactThreshold = radius + 0.025;
+
+    return {
+        leftContact: leftDist < contactThreshold,
+        rightContact: rightDist < contactThreshold,
+        bothContact: leftDist < contactThreshold && rightDist < contactThreshold,
+        leftDist: leftDist,
+        rightDist: rightDist
+    };
+}
+
+function applyGripperPush(obj, contact) {
+    if (obj.isGripped) return;
+
+    const tips = getGripperFingerTips();
+    const objPos = obj.mesh.position;
+
+    // If only one finger touching, push away from that finger
+    if (contact.leftContact && !contact.rightContact) {
+        const pushDir = objPos.clone().sub(tips.left).normalize();
+        pushDir.y = 0;  // Keep push horizontal
+        obj.mesh.position.add(pushDir.multiplyScalar(0.015));
+        obj.velocity.x = pushDir.x * 0.5;
+        obj.velocity.z = pushDir.z * 0.5;
+    }
+    if (contact.rightContact && !contact.leftContact) {
+        const pushDir = objPos.clone().sub(tips.right).normalize();
+        pushDir.y = 0;
+        obj.mesh.position.add(pushDir.multiplyScalar(0.015));
+        obj.velocity.x = pushDir.x * 0.5;
+        obj.velocity.z = pushDir.z * 0.5;
+    }
+}
+
+function gripObject(obj) {
+    if (obj.isGripped || grippedObject) return;
+
+    obj.isGripped = true;
+    grippedObject = obj;
+
+    // Store offset from gripper center
+    const gripperCenter = getGripperCenter();
+    obj.grippedOffset = obj.mesh.position.clone().sub(gripperCenter);
+
+    // Store rotation relative to gripper
+    const gripperQuat = new THREE.Quaternion();
+    robotArm.gripperGroup.getWorldQuaternion(gripperQuat);
+    const gripperQuatInv = gripperQuat.clone().invert();
+    obj.grippedRotation = obj.mesh.quaternion.clone().premultiply(gripperQuatInv);
+
+    // Stop any velocity
+    obj.velocity.set(0, 0, 0);
+
+    terminal.print(`Gripped ${obj.name}`, 'success');
+}
+
+function releaseObject() {
+    if (!grippedObject) return;
+
+    const obj = grippedObject;
+    obj.isGripped = false;
+    obj.grippedOffset = null;
+    obj.grippedRotation = null;
+    grippedObject = null;
+
+    // Give a slight downward velocity when released
+    obj.velocity.set(0, -0.1, 0);
+
+    terminal.print(`Released ${obj.name}`, 'info');
+}
+
+function updateGrippedObjectPosition(obj) {
+    if (!obj.isGripped || !obj.grippedOffset) return;
+
+    // Get gripper world position and rotation
+    const gripperCenter = getGripperCenter();
+    const gripperQuat = new THREE.Quaternion();
+    robotArm.gripperGroup.getWorldQuaternion(gripperQuat);
+
+    // Apply stored offset rotated by current gripper orientation
+    const rotatedOffset = obj.grippedOffset.clone().applyQuaternion(gripperQuat);
+    obj.mesh.position.copy(gripperCenter).add(rotatedOffset);
+
+    // Update rotation to match gripper
+    obj.mesh.quaternion.copy(gripperQuat).multiply(obj.grippedRotation);
+}
+
+function updatePhysics(deltaTime) {
+    // Cap deltaTime to prevent huge jumps
+    deltaTime = Math.min(deltaTime, 0.1);
+
+    for (const obj of sceneObjects) {
+        if (obj.isGripped) {
+            updateGrippedObjectPosition(obj);
+        } else {
+            // Apply gravity
+            obj.velocity.y -= 9.8 * deltaTime;
+
+            // Apply velocity
+            obj.mesh.position.x += obj.velocity.x * deltaTime;
+            obj.mesh.position.y += obj.velocity.y * deltaTime;
+            obj.mesh.position.z += obj.velocity.z * deltaTime;
+
+            // Floor collision
+            const halfHeight = obj.getHalfHeight();
+            if (obj.mesh.position.y < halfHeight) {
+                obj.mesh.position.y = halfHeight;
+                obj.velocity.y = 0;
+                // Apply friction
+                obj.velocity.x *= 0.9;
+                obj.velocity.z *= 0.9;
+                if (Math.abs(obj.velocity.x) < 0.001) obj.velocity.x = 0;
+                if (Math.abs(obj.velocity.z) < 0.001) obj.velocity.z = 0;
+            }
+
+            // Check for gripper contact (push physics)
+            const contact = checkGripperContact(obj);
+            if (contact.leftContact || contact.rightContact) {
+                applyGripperPush(obj, contact);
+            }
+        }
+    }
+}
+
+// ============================================================================
 // KINEMATICS
 // ============================================================================
 
@@ -644,7 +927,10 @@ function solveIK(targetX, targetY, targetZ, maxIterations = 50) {
     // The arm extends in local -X direction when shoulder tilts, so we need to
     // rotate base such that local -X points toward the target direction
     // atan2(y, x) gives angle from +X axis, so we use atan2(targetY, targetX)
-    const baseAngle = Math.PI - Math.atan2(targetY, targetX);
+    let baseAngle = Math.PI - Math.atan2(targetY, targetX);
+    // Normalize to -π to π range to stay within joint limits
+    while (baseAngle > Math.PI) baseAngle -= 2 * Math.PI;
+    while (baseAngle < -Math.PI) baseAngle += 2 * Math.PI;
 
     // Work in 2D plane (r = horizontal distance, h = height relative to shoulder)
     const r = Math.sqrt(targetX * targetX + targetY * targetY);
@@ -764,7 +1050,8 @@ function updateAnimation() {
     const easedProgress = easingFunctions[CONFIG.animation.easing](progress);
 
     // Interpolate all joint angles
-    jointAngles.base = lerp(animationStartAngles.base, targetAngles.base, easedProgress);
+    // Base uses lerpAngle for shortest-path rotation (it's circular -180° to 180°)
+    jointAngles.base = lerpAngle(animationStartAngles.base, targetAngles.base, easedProgress);
     jointAngles.shoulder = lerp(animationStartAngles.shoulder, targetAngles.shoulder, easedProgress);
     jointAngles.elbow = lerp(animationStartAngles.elbow, targetAngles.elbow, easedProgress);
     jointAngles.wrist = lerp(animationStartAngles.wrist, targetAngles.wrist, easedProgress);
@@ -791,6 +1078,29 @@ function updateGripperAnimation() {
     // Smooth interpolation toward target
     const speed = 0.04;  // Slower gripper movement for realism
     const diff = targetGripperOpenness - gripperOpenness;
+    const isClosing = diff < 0;
+    const isOpening = diff > 0;
+
+    // Check for grip/release based on direction
+    if (isClosing && !grippedObject) {
+        // Check if we're about to grip an object
+        for (const obj of sceneObjects) {
+            if (obj.isGripped) continue;
+            const contact = checkGripperContact(obj);
+            if (contact.bothContact) {
+                // Both fingers touching - grip the object!
+                gripObject(obj);
+                // Stop closing - gripper stays at current position
+                targetGripperOpenness = gripperOpenness;
+                gripperAnimating = false;
+                applyGripperOpenness();
+                return;
+            }
+        }
+    } else if (isOpening && grippedObject) {
+        // Opening while gripping - release the object
+        releaseObject();
+    }
 
     if (Math.abs(diff) < 0.3) {
         // Close enough, snap to target
@@ -813,7 +1123,11 @@ function lerpAngle(a, b, t) {
     let diff = b - a;
     while (diff > Math.PI) diff -= 2 * Math.PI;
     while (diff < -Math.PI) diff += 2 * Math.PI;
-    return a + diff * t;
+    let result = a + diff * t;
+    // Normalize result to -π to π range
+    while (result > Math.PI) result -= 2 * Math.PI;
+    while (result < -Math.PI) result += 2 * Math.PI;
+    return result;
 }
 
 // ============================================================================
@@ -823,8 +1137,14 @@ function lerpAngle(a, b, t) {
 function animate() {
     requestAnimationFrame(animate);
 
+    // Calculate delta time for physics
+    const currentTime = performance.now();
+    const deltaTime = (currentTime - lastFrameTime) / 1000;  // Convert to seconds
+    lastFrameTime = currentTime;
+
     updateAnimation();
     updateGripperAnimation();
+    updatePhysics(deltaTime);
     controls.update();
     renderer.render(scene, camera);
 }
@@ -872,14 +1192,47 @@ const terminal = {
         this.input = document.getElementById('terminal-input');
 
         this.input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
+            if (e.key === 'Enter' && e.shiftKey) {
+                // Shift+Enter: add current line to buffer, show continuation prompt
+                e.preventDefault();
+                const line = this.input.value.trim();
+                if (line || multiLineBuffer.length > 0) {
+                    if (multiLineBuffer.length === 0) {
+                        this.print('  (multi-line mode, Enter to execute)', 'info');
+                    }
+                    multiLineBuffer.push(line);
+                    this.print(`  ${multiLineBuffer.length}: ${line || '(empty)'}`, 'info');
+                    this.input.value = '';
+                    this.input.placeholder = '... (Shift+Enter for more, Enter to run)';
+                }
+            } else if (e.key === 'Enter') {
+                // Regular Enter: execute command(s)
                 const command = this.input.value.trim();
-                if (command) {
+
+                if (multiLineBuffer.length > 0) {
+                    // We have buffered lines - add current and execute all
+                    if (command) {
+                        multiLineBuffer.push(command);
+                        this.print(`  ${multiLineBuffer.length}: ${command}`, 'info');
+                    }
+                    // Execute all buffered lines
+                    for (const line of multiLineBuffer) {
+                        if (line) this.executeCommand(line);
+                    }
+                    multiLineBuffer = [];
+                    this.input.placeholder = 'Enter command...';
+                } else if (command) {
                     this.executeCommand(command);
                     commandHistory.unshift(command);
                     historyIndex = -1;
                 }
                 this.input.value = '';
+            } else if (e.key === 'Escape' && multiLineBuffer.length > 0) {
+                // Escape: cancel multi-line mode
+                e.preventDefault();
+                multiLineBuffer = [];
+                this.input.placeholder = 'Enter command...';
+                this.print('  (multi-line cancelled)', 'warning');
             } else if (e.key === 'ArrowUp') {
                 e.preventDefault();
                 if (historyIndex < commandHistory.length - 1) {
@@ -896,6 +1249,22 @@ const terminal = {
                     this.input.value = '';
                 }
             }
+        });
+
+        // Handle paste events for multi-line input (e.g., pasting entire programs)
+        this.input.addEventListener('paste', (e) => {
+            const pastedText = e.clipboardData.getData('text');
+
+            // Check if it's multi-line
+            if (pastedText.includes('\n')) {
+                e.preventDefault();
+                const lines = pastedText.split('\n').map(l => l.trim()).filter(l => l);
+                for (const line of lines) {
+                    this.executeCommand(line);
+                }
+                this.input.value = '';
+            }
+            // Single line paste - let default behavior handle it
         });
 
         // Welcome message
@@ -930,6 +1299,21 @@ const terminal = {
     },
 
     executeCommand(command) {
+        // Check if we're in program recording mode
+        if (programMode) {
+            const trimmed = command.trim().toLowerCase();
+            // 'end' exits program mode, everything else gets recorded
+            if (trimmed === 'end') {
+                this.print(`❯ ${command}`, 'command');
+                handleEndCommand();
+                return;
+            }
+            // Record the command (preserve original case for display)
+            programMode.commands.push(command.trim());
+            this.print(`  ${programMode.commands.length}: ${command}`, 'info');
+            return;
+        }
+
         this.print(`❯ ${command}`, 'command');
 
         if (isAnimating) {
@@ -1069,6 +1453,46 @@ function processCommand(input) {
             handleGripCommand(['0']);
             break;
 
+        case 'spawn':
+        case 'add':
+            handleSpawnCommand(args);
+            break;
+
+        case 'objects':
+        case 'obj':
+            handleObjectsCommand();
+            break;
+
+        case 'remove':
+        case 'rm':
+            handleRemoveCommand(args);
+            break;
+
+        case 'program':
+        case 'prog':
+            handleProgramCommand(args);
+            break;
+
+        case 'run':
+            handleRunCommand(args);
+            break;
+
+        case 'end':
+            handleEndCommand();
+            break;
+
+        case 'wait':
+            handleWaitCommand(args);
+            break;
+
+        case 'repeat':
+            handleRepeatCommand(args);
+            break;
+
+        case 'endrepeat':
+            handleEndRepeatCommand();
+            break;
+
         default:
             terminal.print(`Unknown command: ${command}`, 'error');
             terminal.print('Type "help" for available commands.', 'info');
@@ -1112,6 +1536,33 @@ function showHelp(topic) {
         terminal.print('  open            Fully open gripper', 'info');
         terminal.print('  close           Fully close gripper', 'info');
         terminal.print('    Use +/- for relative: grip +20, grip -10', 'info');
+        terminal.print('');
+        terminal.print('OBJECTS:', 'warning');
+        terminal.print('  spawn [type] [x y z] [Nmm]  Add object (cube/cylinder/sphere)', 'info');
+        terminal.print('  objects               List all objects in scene', 'info');
+        terminal.print('  remove <name|all>     Remove object(s)', 'info');
+        terminal.print('');
+        terminal.print('PROGRAMS:', 'warning');
+        terminal.print('  program new <name>    Start recording a program', 'info');
+        terminal.print('  program               List all programs', 'info');
+        terminal.print('  program show <name>   Display program contents', 'info');
+        terminal.print('  program edit <name>   Add commands to existing program', 'info');
+        terminal.print('  program delete <name> Delete a program', 'info');
+        terminal.print('  run <name>            Execute a program', 'info');
+        terminal.print('  program stop          Stop running program', 'info');
+        terminal.print('  end                   Finish recording', 'info');
+        terminal.print('');
+        terminal.print('PROGRAM COMMANDS (inside programs only):', 'warning');
+        terminal.print('  wait <ms>             Pause for N milliseconds', 'info');
+        terminal.print('  repeat <n>            Start loop (repeat N times)', 'info');
+        terminal.print('  endrepeat             End of repeat block', 'info');
+        terminal.print('  spawn ...             Add objects during program', 'info');
+        terminal.print('  # comment             Comment (ignored)', 'info');
+        terminal.print('');
+        terminal.print('TIPS:', 'warning');
+        terminal.print('  Shift+Enter           Multi-line input mode', 'info');
+        terminal.print('  Escape                Cancel multi-line mode', 'info');
+        terminal.print('  Paste multi-line      Auto-executes each line', 'info');
         terminal.print('');
         terminal.print('UTILITY:', 'warning');
         terminal.print('  home | h        Reset arm to home position', 'info');
@@ -1191,6 +1642,105 @@ function showCommandHelp(cmd) {
             'Examples:',
             '  speed 500   (faster)',
             '  speed 2000  (slower)'
+        ],
+        'spawn': [
+            'SPAWN - Add a physics object to the scene',
+            '',
+            'Usage: spawn [type] [x y z] [Nmm]',
+            'Alias: add',
+            '',
+            'Types: cube (default), cylinder, sphere',
+            'Position: x y z in cm (optional, defaults to random)',
+            'Size: Nmm where N is 10-500 (optional, defaults to 80mm)',
+            '',
+            'Objects can be picked up with the gripper.',
+            'Gripper must contact object with both fingers to grip.',
+            '',
+            'Examples:',
+            '  spawn              - Random 80mm cube at random position',
+            '  spawn sphere       - 80mm sphere at random position',
+            '  spawn cube 0 100 0 - 80mm cube at (0, 100, 0) cm',
+            '  spawn 50mm         - 50mm cube at random position',
+            '  spawn sphere 120mm - 120mm sphere at random position',
+            '  spawn cube 0 100 0 150mm - 150mm cube at position'
+        ],
+        'objects': [
+            'OBJECTS - List all objects in the scene',
+            '',
+            'Usage: objects',
+            'Alias: obj',
+            '',
+            'Shows object names, positions, and grip status.'
+        ],
+        'remove': [
+            'REMOVE - Remove objects from the scene',
+            '',
+            'Usage: remove <name|all>',
+            'Alias: rm',
+            '',
+            'Examples:',
+            '  remove cube_1  - Remove specific object',
+            '  remove all     - Remove all objects'
+        ],
+        'program': [
+            'PROGRAM - Create and manage automation programs',
+            '',
+            'Usage: program [subcommand] [name]',
+            'Alias: prog',
+            '',
+            'Subcommands:',
+            '  new <name>     Start recording a new program',
+            '  show <name>    Display program contents',
+            '  edit <name>    Append commands to existing program',
+            '  delete <name>  Remove a program',
+            '  stop           Stop currently running program',
+            '  (none)         List all programs',
+            '',
+            'Recording mode:',
+            '  After "program new", all commands are recorded.',
+            '  Type "end" to save and exit recording mode.',
+            '',
+            'Special commands (inside programs only):',
+            '  wait <ms>      Pause execution for N milliseconds',
+            '  repeat <n>     Start a loop that repeats N times',
+            '  endrepeat      End of repeat block',
+            '  # text         Comment (ignored during execution)',
+            '',
+            'Example program:',
+            '  program new pickplace',
+            '  # Spawn a block and pick it up',
+            '  spawn cube 100 150 0',
+            '  wait 500',
+            '  goto 100 150 50',
+            '  goto 100 150 5',
+            '  close',
+            '  wait 500',
+            '  goto 100 150 50',
+            '  # Move to drop position',
+            '  goto -100 150 50',
+            '  goto -100 150 5',
+            '  open',
+            '  wait 500',
+            '  home',
+            '  end',
+            '',
+            'Run with: run pickplace',
+            '',
+            'Tip: Use Shift+Enter to write multi-line programs',
+            'directly, or paste an entire program at once.'
+        ],
+        'run': [
+            'RUN - Execute a saved program',
+            '',
+            'Usage: run <name>',
+            '',
+            'Executes all commands in the program sequentially.',
+            'The program waits for each motion to complete.',
+            '',
+            'Use "program stop" to abort execution.',
+            '',
+            'Example:',
+            '  run pickplace'
         ]
     };
 
@@ -1261,6 +1811,8 @@ function handleHomeCommand() {
     setJointAngles(180, -20, 90, 45);
     // Reset wrist rotation
     targetAngles.wristRotate = 0;
+    // Reset gripper to default (50% open)
+    setGripperOpenness(50);
 }
 
 function handleStatusCommand() {
@@ -1428,6 +1980,11 @@ const PRESETS = {
 // User-saved positions
 const savedPositions = {};
 
+// User programs (scripts)
+const programs = {};
+let programMode = null;  // null or { name: string, commands: [] }
+let runningProgram = null;  // null or { name, commands, index, loopStack, paused }
+
 function handlePresetCommand(args) {
     if (args.length < 1) {
         terminal.print('');
@@ -1533,6 +2090,150 @@ function handleGripCommand(args) {
     setGripperOpenness(percent);
 }
 
+// Check if a position is reachable by the arm (in cm)
+function isPositionReachable(xCm, yCm, zCm) {
+    // Convert cm to internal units (1 unit = 100cm)
+    const x = xCm / 100;
+    const y = yCm / 100;
+    const z = zCm / 100;
+
+    const result = solveIK(x, y, z);
+    return result.success;
+}
+
+// Get the minimum horizontal reach distance at a given height (in cm)
+// This is the inner boundary where the arm cannot reach
+function getMinReachAtHeight(heightCm) {
+    // Test positions at this height to find minimum reachable distance
+    // Start from center and move outward until we find a reachable position
+    for (let dist = 0; dist <= 300; dist += 5) {
+        if (isPositionReachable(dist, 0, heightCm)) {
+            return dist;
+        }
+    }
+    return 300; // Fallback - shouldn't happen
+}
+
+function handleSpawnCommand(args) {
+    // Parse type (default: cube)
+    let type = 'cube';
+    let x, y, z;
+    let sizeMm = 80; // Default size: 80mm
+
+    if (args.length >= 1 && ['cube', 'cylinder', 'sphere'].includes(args[0])) {
+        type = args[0];
+        args = args.slice(1);
+    }
+
+    // Check for size parameter (e.g., "50mm" or "120mm")
+    const sizeArgIndex = args.findIndex(arg => /^\d+mm$/i.test(arg));
+    if (sizeArgIndex !== -1) {
+        sizeMm = parseInt(args[sizeArgIndex]);
+        if (sizeMm < 10 || sizeMm > 500) {
+            terminal.print('Error: Size must be between 10mm and 500mm', 'error');
+            return;
+        }
+        args.splice(sizeArgIndex, 1); // Remove size arg from position parsing
+    }
+
+    // Parse position (default: random within reach)
+    if (args.length >= 3) {
+        x = parseFloat(args[0]);
+        y = parseFloat(args[1]);
+        z = parseFloat(args[2]);
+
+        if (isNaN(x) || isNaN(y) || isNaN(z)) {
+            terminal.print('Error: Position must be numbers (x y z in cm)', 'error');
+            return;
+        }
+
+        // Validate that the position is reachable by the arm
+        if (!isPositionReachable(x, y, z)) {
+            const horizontalDist = Math.sqrt(x * x + y * y).toFixed(0);
+            const maxReach = (CONFIG.segments.shoulderLength + CONFIG.segments.elbowLength) * 100;
+            const minReach = getMinReachAtHeight(z);
+            terminal.print(`Error: Position (${x.toFixed(0)}, ${y.toFixed(0)}, ${z.toFixed(0)}) cm is not reachable by the arm`, 'error');
+            terminal.print(`  Horizontal distance: ${horizontalDist} cm`, 'info');
+            terminal.print(`  Reachable range at height ${z.toFixed(0)} cm: ~${minReach}-${maxReach.toFixed(0)} cm`, 'info');
+            return;
+        }
+    } else {
+        // Random position within arm reach, ensuring it's actually reachable
+        const maxReach = (CONFIG.segments.shoulderLength + CONFIG.segments.elbowLength) * 100;
+        let attempts = 0;
+        const maxAttempts = 50;
+
+        // Try to find a valid random position
+        do {
+            const angle = Math.random() * Math.PI * 2;
+            // Use a range that's more likely to be reachable (between min reach and 80% of max)
+            const minDist = 85; // Approximate minimum horizontal reach
+            const maxDist = maxReach * 0.8;
+            const distance = minDist + Math.random() * (maxDist - minDist);
+            x = Math.cos(angle) * distance;
+            y = Math.sin(angle) * distance;
+            z = 4 + Math.random() * 30;  // 4-34cm height (object size + some margin, will fall to floor)
+            attempts++;
+        } while (!isPositionReachable(x, y, z) && attempts < maxAttempts);
+
+        if (attempts >= maxAttempts) {
+            terminal.print('Error: Could not find a valid spawn position', 'error');
+            return;
+        }
+    }
+
+    const obj = createObject(type, x, y, z, sizeMm);
+    terminal.print(`Spawned ${obj.name} (${sizeMm}mm) at (${x.toFixed(0)}, ${y.toFixed(0)}, ${z.toFixed(0)}) cm`, 'success');
+}
+
+function handleObjectsCommand() {
+    if (sceneObjects.length === 0) {
+        terminal.print('No objects in scene.', 'info');
+        terminal.print('Use "spawn" to add objects.', 'info');
+        return;
+    }
+
+    terminal.print('');
+    terminal.print('━━━ SCENE OBJECTS ━━━', 'highlight');
+    for (const obj of sceneObjects) {
+        // Convert Three.js position to robotics coordinates (cm)
+        const x = (obj.mesh.position.x * 100).toFixed(0);
+        const y = (obj.mesh.position.z * 100).toFixed(0);  // Z in Three.js is Y in robotics
+        const z = (obj.mesh.position.y * 100).toFixed(0);  // Y in Three.js is Z in robotics
+        const status = obj.isGripped ? ' [GRIPPED]' : '';
+        terminal.print(`  ${obj.name}: (${x}, ${y}, ${z}) cm${status}`, obj.isGripped ? 'success' : 'info');
+    }
+    terminal.print('');
+}
+
+function handleRemoveCommand(args) {
+    if (args.length < 1) {
+        terminal.print('Usage: remove <name|all>', 'error');
+        terminal.print('Type "objects" to see object names.', 'info');
+        return;
+    }
+
+    const target = args[0].toLowerCase();
+
+    if (target === 'all') {
+        const count = sceneObjects.length;
+        removeAllObjects();
+        terminal.print(`Removed all ${count} object(s).`, 'success');
+        return;
+    }
+
+    // Find object by name
+    const obj = sceneObjects.find(o => o.name.toLowerCase() === target);
+    if (!obj) {
+        terminal.print(`Error: No object named "${target}"`, 'error');
+        terminal.print('Type "objects" to see object names.', 'info');
+        return;
+    }
+
+    removeObject(obj);
+    terminal.print(`Removed ${target}.`, 'success');
+}
+
 function handleSaveCommand(args) {
     if (args.length < 1) {
         terminal.print('Usage: save <name>', 'error');
@@ -1632,6 +2333,301 @@ function handleDeletePositionCommand(args) {
     terminal.print(`Position "${name}" deleted.`, 'success');
 }
 
+// ============================================================================
+// PROGRAM/SCRIPT SYSTEM
+// ============================================================================
+
+function handleProgramCommand(args) {
+    if (args.length < 1) {
+        // List all programs
+        const names = Object.keys(programs);
+        if (names.length === 0) {
+            terminal.print('No programs defined.', 'info');
+            terminal.print('Use "program new <name>" to create a program.', 'info');
+        } else {
+            terminal.print('');
+            terminal.print('━━━ PROGRAMS ━━━', 'highlight');
+            for (const name of names) {
+                const prog = programs[name];
+                terminal.print(`  ${name.padEnd(12)} (${prog.commands.length} commands)`, 'info');
+            }
+            terminal.print('');
+            terminal.print('Use "program show <name>" to view a program.', 'info');
+            terminal.print('Use "run <name>" to execute a program.', 'info');
+        }
+        return;
+    }
+
+    const subcommand = args[0].toLowerCase();
+
+    switch (subcommand) {
+        case 'new':
+            if (args.length < 2) {
+                terminal.print('Usage: program new <name>', 'error');
+                return;
+            }
+            const newName = args[1].toLowerCase();
+            if (programs[newName]) {
+                terminal.print(`Error: Program "${newName}" already exists. Delete it first.`, 'error');
+                return;
+            }
+            programMode = { name: newName, commands: [] };
+            terminal.print('');
+            terminal.print(`━━━ RECORDING: ${newName.toUpperCase()} ━━━`, 'warning');
+            terminal.print('Enter commands to record. Type "end" to finish.', 'info');
+            terminal.print('');
+            break;
+
+        case 'show':
+        case 'cat':
+            if (args.length < 2) {
+                terminal.print('Usage: program show <name>', 'error');
+                return;
+            }
+            const showName = args[1].toLowerCase();
+            if (!programs[showName]) {
+                terminal.print(`Error: Program "${showName}" not found.`, 'error');
+                return;
+            }
+            terminal.print('');
+            terminal.print(`━━━ PROGRAM: ${showName.toUpperCase()} ━━━`, 'highlight');
+            programs[showName].commands.forEach((cmd, i) => {
+                const lineNum = String(i + 1).padStart(3, ' ');
+                terminal.print(`${lineNum}: ${cmd}`, cmd.startsWith('#') ? 'info' : '');
+            });
+            terminal.print('');
+            break;
+
+        case 'delete':
+        case 'del':
+        case 'rm':
+            if (args.length < 2) {
+                terminal.print('Usage: program delete <name>', 'error');
+                return;
+            }
+            const delName = args[1].toLowerCase();
+            if (!programs[delName]) {
+                terminal.print(`Error: Program "${delName}" not found.`, 'error');
+                return;
+            }
+            delete programs[delName];
+            terminal.print(`Program "${delName}" deleted.`, 'success');
+            break;
+
+        case 'edit':
+            if (args.length < 2) {
+                terminal.print('Usage: program edit <name>', 'error');
+                return;
+            }
+            const editName = args[1].toLowerCase();
+            if (!programs[editName]) {
+                terminal.print(`Error: Program "${editName}" not found.`, 'error');
+                return;
+            }
+            // Enter edit mode with existing commands
+            programMode = { name: editName, commands: [...programs[editName].commands] };
+            terminal.print('');
+            terminal.print(`━━━ EDITING: ${editName.toUpperCase()} ━━━`, 'warning');
+            terminal.print('Current commands:', 'info');
+            programMode.commands.forEach((cmd, i) => {
+                terminal.print(`  ${i + 1}: ${cmd}`, 'info');
+            });
+            terminal.print('');
+            terminal.print('Enter additional commands. Type "end" to save.', 'info');
+            break;
+
+        case 'stop':
+            if (runningProgram) {
+                terminal.print(`Program "${runningProgram.name}" stopped.`, 'warning');
+                runningProgram = null;
+            } else {
+                terminal.print('No program is running.', 'info');
+            }
+            break;
+
+        default:
+            // Check if it's a program name to show
+            if (programs[subcommand]) {
+                terminal.print('');
+                terminal.print(`━━━ PROGRAM: ${subcommand.toUpperCase()} ━━━`, 'highlight');
+                programs[subcommand].commands.forEach((cmd, i) => {
+                    const lineNum = String(i + 1).padStart(3, ' ');
+                    terminal.print(`${lineNum}: ${cmd}`, cmd.startsWith('#') ? 'info' : '');
+                });
+                terminal.print('');
+            } else {
+                terminal.print(`Unknown subcommand: ${subcommand}`, 'error');
+                terminal.print('Usage: program [new|show|edit|delete|stop] <name>', 'info');
+            }
+    }
+}
+
+function handleEndCommand() {
+    if (programMode) {
+        // Save the program
+        programs[programMode.name] = {
+            commands: programMode.commands,
+            created: new Date().toISOString()
+        };
+        terminal.print('');
+        terminal.print(`━━━ PROGRAM SAVED: ${programMode.name.toUpperCase()} ━━━`, 'success');
+        terminal.print(`${programMode.commands.length} commands recorded.`, 'info');
+        terminal.print(`Use "run ${programMode.name}" to execute.`, 'info');
+        terminal.print('');
+        programMode = null;
+    } else {
+        terminal.print('Not currently recording a program.', 'error');
+    }
+}
+
+function handleRunCommand(args) {
+    if (args.length < 1) {
+        terminal.print('Usage: run <program_name>', 'error');
+        return;
+    }
+
+    const name = args[0].toLowerCase();
+    if (!programs[name]) {
+        terminal.print(`Error: Program "${name}" not found.`, 'error');
+        terminal.print('Use "program" to see available programs.', 'info');
+        return;
+    }
+
+    if (runningProgram) {
+        terminal.print(`Error: Program "${runningProgram.name}" is already running.`, 'error');
+        terminal.print('Use "program stop" to stop it first.', 'info');
+        return;
+    }
+
+    terminal.print('');
+    terminal.print(`━━━ RUNNING: ${name.toUpperCase()} ━━━`, 'warning');
+
+    runningProgram = {
+        name: name,
+        commands: [...programs[name].commands],
+        index: 0,
+        loopStack: []  // Stack of { startIndex, remaining }
+    };
+
+    // Start executing
+    executeNextProgramCommand();
+}
+
+function executeNextProgramCommand() {
+    if (!runningProgram) return;
+
+    // Check if program is complete
+    if (runningProgram.index >= runningProgram.commands.length) {
+        terminal.print('');
+        terminal.print(`━━━ PROGRAM COMPLETE: ${runningProgram.name.toUpperCase()} ━━━`, 'success');
+        runningProgram = null;
+        return;
+    }
+
+    const command = runningProgram.commands[runningProgram.index];
+    runningProgram.index++;
+
+    // Skip empty lines and comments
+    const trimmed = command.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+        executeNextProgramCommand();
+        return;
+    }
+
+    const parts = trimmed.toLowerCase().split(/\s+/);
+    const cmd = parts[0];
+
+    // Handle special program-only commands
+    if (cmd === 'wait') {
+        const ms = parseInt(parts[1]) || 1000;
+        terminal.print(`  [wait ${ms}ms]`, 'info');
+        setTimeout(() => {
+            if (runningProgram) {
+                executeNextProgramCommand();
+            }
+        }, ms);
+        return;
+    }
+
+    if (cmd === 'repeat') {
+        const times = parseInt(parts[1]) || 1;
+        runningProgram.loopStack.push({
+            startIndex: runningProgram.index,
+            remaining: times - 1  // -1 because first iteration is current
+        });
+        terminal.print(`  [repeat ${times}x]`, 'info');
+        executeNextProgramCommand();
+        return;
+    }
+
+    if (cmd === 'endrepeat') {
+        if (runningProgram.loopStack.length > 0) {
+            const loop = runningProgram.loopStack[runningProgram.loopStack.length - 1];
+            if (loop.remaining > 0) {
+                loop.remaining--;
+                runningProgram.index = loop.startIndex;
+                terminal.print(`  [loop ${loop.remaining + 1} remaining]`, 'info');
+            } else {
+                runningProgram.loopStack.pop();
+            }
+        }
+        executeNextProgramCommand();
+        return;
+    }
+
+    // Regular command - print and execute
+    terminal.print(`  → ${trimmed}`, 'command');
+    processCommand(trimmed);
+
+    // Wait for animation to complete before next command
+    if (isAnimating || gripperAnimating) {
+        waitForAnimationThenContinue();
+    } else {
+        // Small delay between instant commands for readability
+        setTimeout(() => {
+            if (runningProgram) {
+                executeNextProgramCommand();
+            }
+        }, 100);
+    }
+}
+
+function waitForAnimationThenContinue() {
+    if (!runningProgram) return;
+
+    if (isAnimating || gripperAnimating) {
+        setTimeout(waitForAnimationThenContinue, 50);
+    } else {
+        // Small pause after animation completes
+        setTimeout(() => {
+            if (runningProgram) {
+                executeNextProgramCommand();
+            }
+        }, 100);
+    }
+}
+
+function handleWaitCommand(args) {
+    // Wait only works during program execution
+    if (!runningProgram) {
+        terminal.print('Note: "wait" only has effect inside programs.', 'info');
+        terminal.print('Use "program new <name>" to create a program.', 'info');
+    }
+}
+
+function handleRepeatCommand(args) {
+    if (!runningProgram) {
+        terminal.print('Note: "repeat" only has effect inside programs.', 'info');
+        terminal.print('Use "program new <name>" to create a program.', 'info');
+    }
+}
+
+function handleEndRepeatCommand() {
+    if (!runningProgram) {
+        terminal.print('Note: "endrepeat" only has effect inside programs.', 'info');
+    }
+}
+
 async function runDemo() {
     terminal.print('Starting demonstration sequence...', 'warning');
 
@@ -1692,12 +2688,480 @@ window.setSideView = setSideView;
 window.setFrontView = setFrontView;
 
 // ============================================================================
+// NOTEBOOK / SCRIPT EDITOR
+// ============================================================================
+
+const notebook = {
+    modal: null,
+    container: null,
+    editor: null,
+    tabsContainer: null,
+    tabs: [],          // Array of { id, name, content, modified, savedName }
+    activeTabId: null,
+    tabCounter: 0,
+    savedScripts: {},  // Loaded from localStorage
+
+    // Window state
+    isMinimized: false,
+    isMaximized: false,
+    savedBounds: null, // For restore after maximize
+    isDragging: false,
+    dragOffset: { x: 0, y: 0 },
+
+    init() {
+        this.modal = document.getElementById('notebook-modal');
+        this.container = document.getElementById('notebook-container');
+        this.editor = document.getElementById('notebook-editor');
+        this.tabsContainer = document.getElementById('notebook-tabs');
+
+        // Load saved scripts from localStorage
+        this.loadFromStorage();
+
+        // Create initial tab
+        this.newTab();
+
+        // Editor event listeners
+        this.editor.addEventListener('input', () => this.onEditorChange());
+        this.editor.addEventListener('keydown', (e) => this.onEditorKeydown(e));
+
+        // Setup dragging
+        this.setupDragging();
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && this.modal.classList.contains('open')) {
+                if (document.getElementById('save-dialog').classList.contains('open')) {
+                    this.hideSave();
+                } else if (document.getElementById('load-dialog').classList.contains('open')) {
+                    this.hideLoad();
+                } else {
+                    this.close();
+                }
+            }
+            // Ctrl+S to save
+            if (e.ctrlKey && e.key === 's' && this.modal.classList.contains('open')) {
+                e.preventDefault();
+                this.showSave();
+            }
+            // Ctrl+Enter to run
+            if (e.ctrlKey && e.key === 'Enter' && this.modal.classList.contains('open')) {
+                e.preventDefault();
+                this.run();
+            }
+        });
+
+        // Enter key in save dialog
+        document.getElementById('save-script-name').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                this.confirmSave();
+            }
+        });
+    },
+
+    setupDragging() {
+        const header = document.getElementById('notebook-header');
+
+        header.addEventListener('mousedown', (e) => {
+            // Don't drag if clicking buttons
+            if (e.target.closest('.notebook-window-btn') || e.target.closest('.notebook-header-btns')) return;
+            if (this.isMaximized) return;
+
+            this.isDragging = true;
+            const rect = this.modal.getBoundingClientRect();
+            this.dragOffset.x = e.clientX - rect.left;
+            this.dragOffset.y = e.clientY - rect.top;
+
+            header.style.cursor = 'grabbing';
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!this.isDragging) return;
+
+            const x = e.clientX - this.dragOffset.x;
+            const y = e.clientY - this.dragOffset.y;
+
+            this.modal.style.left = x + 'px';
+            this.modal.style.top = y + 'px';
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (this.isDragging) {
+                this.isDragging = false;
+                document.getElementById('notebook-header').style.cursor = 'move';
+            }
+        });
+    },
+
+    open() {
+        if (!this.modal.classList.contains('open')) {
+            // Position in center on first open
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+            this.modal.style.left = (vw - 700) / 2 + 'px';
+            this.modal.style.top = (vh - 500) / 2 + 'px';
+        }
+        this.modal.classList.add('open');
+        this.isMinimized = false;
+        this.container.style.display = 'flex';
+        this.editor.focus();
+    },
+
+    close() {
+        this.modal.classList.remove('open');
+        this.hideLoad();
+        this.hideSave();
+    },
+
+    restore() {
+        // Restore to previous size from maximized state
+        if (this.isMaximized && this.savedBounds) {
+            this.modal.style.left = this.savedBounds.left;
+            this.modal.style.top = this.savedBounds.top;
+            this.container.style.width = this.savedBounds.width;
+            this.container.style.height = this.savedBounds.height;
+            this.isMaximized = false;
+        }
+    },
+
+    maximize() {
+        if (this.isMaximized) return; // Already maximized
+
+        // Save current bounds
+        this.savedBounds = {
+            left: this.modal.style.left,
+            top: this.modal.style.top,
+            width: this.container.style.width || '700px',
+            height: this.container.style.height || '500px'
+        };
+        // Maximize
+        const terminalWidth = document.getElementById('terminal-panel').offsetWidth;
+        this.modal.style.left = '20px';
+        this.modal.style.top = '20px';
+        this.container.style.width = (window.innerWidth - terminalWidth - 40) + 'px';
+        this.container.style.height = (window.innerHeight - 40) + 'px';
+        this.isMaximized = true;
+    },
+
+    // Tab Management
+    newTab(name = null, content = '') {
+        this.tabCounter++;
+        const id = this.tabCounter;
+        const tabName = name || `script_${id}`;
+
+        const tab = { id, name: tabName, content, modified: false };
+        this.tabs.push(tab);
+
+        this.renderTabs();
+        this.switchTab(id);
+
+        return tab;
+    },
+
+    switchTab(id) {
+        // Save current tab content
+        if (this.activeTabId) {
+            const currentTab = this.tabs.find(t => t.id === this.activeTabId);
+            if (currentTab) {
+                currentTab.content = this.editor.value;
+            }
+        }
+
+        this.activeTabId = id;
+        const tab = this.tabs.find(t => t.id === id);
+        if (tab) {
+            this.editor.value = tab.content;
+            this.updateStatus();
+        }
+
+        this.renderTabs();
+    },
+
+    closeTab(id, event) {
+        if (event) event.stopPropagation();
+
+        const index = this.tabs.findIndex(t => t.id === id);
+        if (index === -1) return;
+
+        const tab = this.tabs[index];
+
+        // Confirm if modified
+        if (tab.modified) {
+            if (!confirm(`"${tab.name}" has unsaved changes. Close anyway?`)) {
+                return;
+            }
+        }
+
+        this.tabs.splice(index, 1);
+
+        // If we closed the active tab, switch to another
+        if (this.activeTabId === id) {
+            if (this.tabs.length > 0) {
+                const newIndex = Math.min(index, this.tabs.length - 1);
+                this.switchTab(this.tabs[newIndex].id);
+            } else {
+                // No tabs left, create a new one
+                this.newTab();
+            }
+        } else {
+            this.renderTabs();
+        }
+    },
+
+    renderTabs() {
+        // Remove existing tab elements (keep the add button)
+        const addBtn = document.getElementById('notebook-tab-add');
+        this.tabsContainer.innerHTML = '';
+
+        for (const tab of this.tabs) {
+            const tabEl = document.createElement('button');
+            tabEl.className = 'notebook-tab' + (tab.id === this.activeTabId ? ' active' : '') + (tab.modified ? ' modified' : '');
+            tabEl.onclick = () => this.switchTab(tab.id);
+
+            tabEl.innerHTML = `
+                <span class="tab-modified"></span>
+                <span class="tab-name">${tab.name}</span>
+                <span class="tab-close" onclick="notebook.closeTab(${tab.id}, event)">
+                    <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                </span>
+            `;
+
+            this.tabsContainer.appendChild(tabEl);
+        }
+
+        this.tabsContainer.appendChild(addBtn);
+    },
+
+    onEditorChange() {
+        const tab = this.tabs.find(t => t.id === this.activeTabId);
+        if (tab) {
+            tab.content = this.editor.value;
+            if (!tab.modified) {
+                tab.modified = true;
+                this.renderTabs();
+            }
+        }
+        this.updateStatus();
+    },
+
+    onEditorKeydown(e) {
+        // Handle Tab key for indentation
+        if (e.key === 'Tab') {
+            e.preventDefault();
+            const start = this.editor.selectionStart;
+            const end = this.editor.selectionEnd;
+            const value = this.editor.value;
+
+            this.editor.value = value.substring(0, start) + '    ' + value.substring(end);
+            this.editor.selectionStart = this.editor.selectionEnd = start + 4;
+            this.onEditorChange();
+        }
+    },
+
+    updateStatus() {
+        const content = this.editor.value;
+        const lines = content.split('\n').length;
+        const chars = content.length;
+
+        document.getElementById('notebook-line-count').textContent = `Lines: ${lines}`;
+        document.getElementById('notebook-char-count').textContent = `Chars: ${chars}`;
+
+        const tab = this.tabs.find(t => t.id === this.activeTabId);
+        const saveStatus = document.getElementById('notebook-save-status');
+        if (tab && tab.savedName && this.savedScripts[tab.savedName]) {
+            saveStatus.textContent = tab.modified ? 'Modified' : 'Saved';
+            saveStatus.style.color = tab.modified ? '#f0883e' : '#7ee787';
+        } else {
+            saveStatus.textContent = 'Not saved';
+            saveStatus.style.color = '#8b949e';
+        }
+    },
+
+    // Save/Load
+    showSave() {
+        const tab = this.tabs.find(t => t.id === this.activeTabId);
+        if (!tab) return;
+
+        const input = document.getElementById('save-script-name');
+        input.value = tab.savedName || tab.name;
+        document.getElementById('save-dialog').classList.add('open');
+        input.focus();
+        input.select();
+    },
+
+    hideSave() {
+        document.getElementById('save-dialog').classList.remove('open');
+    },
+
+    confirmSave() {
+        const tab = this.tabs.find(t => t.id === this.activeTabId);
+        if (!tab) return;
+
+        const name = document.getElementById('save-script-name').value.trim();
+        if (!name) {
+            terminal.print('Error: Please enter a script name', 'error');
+            return;
+        }
+
+        tab.name = name;
+        tab.savedName = name;
+        tab.modified = false;
+
+        this.savedScripts[name] = {
+            content: this.editor.value,
+            savedAt: new Date().toISOString()
+        };
+
+        this.saveToStorage();
+        this.renderTabs();
+        this.updateStatus();
+        this.hideSave();
+
+        terminal.print(`Script "${name}" saved.`, 'success');
+    },
+
+    showLoad() {
+        const dialog = document.getElementById('load-dialog');
+        const list = document.getElementById('saved-scripts-list');
+
+        list.innerHTML = '';
+
+        const names = Object.keys(this.savedScripts);
+        if (names.length === 0) {
+            list.innerHTML = '<div style="padding: 16px; color: #8b949e; text-align: center;">No saved scripts</div>';
+        } else {
+            for (const name of names) {
+                const script = this.savedScripts[name];
+                const date = new Date(script.savedAt).toLocaleDateString();
+
+                const item = document.createElement('div');
+                item.className = 'saved-script-item';
+                item.innerHTML = `
+                    <div>
+                        <div class="script-name">${name}</div>
+                        <div class="script-date">${date}</div>
+                    </div>
+                    <button class="script-delete" onclick="notebook.deleteScript('${name}', event)" title="Delete">
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                    </button>
+                `;
+                item.onclick = (e) => {
+                    if (!e.target.closest('.script-delete')) {
+                        this.load(name);
+                        this.hideLoad();
+                    }
+                };
+                list.appendChild(item);
+            }
+        }
+
+        dialog.classList.add('open');
+    },
+
+    hideLoad() {
+        document.getElementById('load-dialog').classList.remove('open');
+    },
+
+    load(name) {
+        const script = this.savedScripts[name];
+        if (!script) return;
+
+        // Check if already open in a tab
+        const existingTab = this.tabs.find(t => t.savedName === name);
+        if (existingTab) {
+            this.switchTab(existingTab.id);
+            return;
+        }
+
+        // Create new tab with this content
+        const tab = this.newTab(name, script.content);
+        tab.savedName = name;
+        tab.modified = false;
+        this.renderTabs();
+        this.updateStatus();
+    },
+
+    deleteScript(name, event) {
+        if (event) event.stopPropagation();
+
+        if (!confirm(`Delete script "${name}"?`)) return;
+
+        delete this.savedScripts[name];
+        this.saveToStorage();
+        this.showLoad(); // Refresh the list
+
+        terminal.print(`Script "${name}" deleted.`, 'warning');
+    },
+
+    saveToStorage() {
+        try {
+            localStorage.setItem('robotarm_scripts', JSON.stringify(this.savedScripts));
+        } catch (e) {
+            console.error('Failed to save to localStorage:', e);
+        }
+    },
+
+    loadFromStorage() {
+        try {
+            const data = localStorage.getItem('robotarm_scripts');
+            if (data) {
+                this.savedScripts = JSON.parse(data);
+            }
+        } catch (e) {
+            console.error('Failed to load from localStorage:', e);
+            this.savedScripts = {};
+        }
+    },
+
+    // Run the script directly (don't close window)
+    run() {
+        const content = this.editor.value.trim();
+        if (!content) {
+            terminal.print('Error: Script is empty', 'error');
+            return;
+        }
+
+        // Filter out empty lines and comments
+        const lines = content.split('\n')
+            .map(l => l.trim())
+            .filter(l => l && !l.startsWith('#'));
+
+        if (lines.length === 0) {
+            terminal.print('Error: No commands to run', 'error');
+            return;
+        }
+
+        const tab = this.tabs.find(t => t.id === this.activeTabId);
+        const name = tab?.savedName || tab?.name || 'script';
+
+        // Don't close the notebook - keep it open!
+
+        // Run the script
+        terminal.print('');
+        terminal.print(`━━━ RUNNING: ${name.toUpperCase()} ━━━`, 'warning');
+
+        // Execute as a program
+        runningProgram = {
+            name: name,
+            commands: [...lines],
+            index: 0,
+            loopStack: []
+        };
+
+        executeNextProgramCommand();
+    }
+};
+
+// Make notebook global
+window.notebook = notebook;
+
+// ============================================================================
 // INITIALIZATION
 // ============================================================================
 
 document.addEventListener('DOMContentLoaded', () => {
     initScene();
     terminal.init();
+    notebook.init();
 
     // Focus terminal input
     document.getElementById('terminal-input').focus();

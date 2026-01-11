@@ -93,10 +93,28 @@
 
         #terminal-panel {
             width: 400px;
+            min-width: 280px;
+            max-width: 600px;
             background: #0d1117;
             border-left: 1px solid #30363d;
             display: flex;
             flex-direction: column;
+            position: relative;
+        }
+
+        #terminal-resize-handle {
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+            cursor: ew-resize;
+            background: transparent;
+            z-index: 10;
+        }
+
+        #terminal-resize-handle:hover {
+            background: #58a6ff;
         }
 
         #terminal-header {
@@ -114,9 +132,9 @@
             border-radius: 50%;
         }
 
-        .dot-red { background: #ff5f56; }
-        .dot-yellow { background: #ffbd2e; }
-        .dot-green { background: #27c93f; }
+        .dot-red { background: #6e4444; }
+        .dot-yellow { background: #6e6144; }
+        .dot-green { background: #446e4a; }
 
         #terminal-title {
             margin-left: 8px;
@@ -265,6 +283,438 @@
             color: #e0e0e0;
             border-color: #58a6ff;
         }
+
+        /* Floating Notebook Button */
+        #notebook-fab {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 56px;
+            height: 56px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #58a6ff 0%, #3b82f6 100%);
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            z-index: 100;
+        }
+
+        #notebook-fab:hover {
+            transform: scale(1.05);
+            background: linear-gradient(135deg, #79b8ff 0%, #5a9cf6 100%);
+        }
+
+        #notebook-fab svg {
+            width: 24px;
+            height: 24px;
+            fill: white;
+        }
+
+        /* Notebook Window (non-modal, draggable, resizable) */
+        #notebook-modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+        }
+
+        #notebook-modal.open {
+            display: block;
+        }
+
+        #notebook-container {
+            width: 700px;
+            height: 500px;
+            min-width: 400px;
+            min-height: 300px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            resize: both;
+            overflow: hidden;
+        }
+
+        #notebook-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 12px;
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            border-radius: 8px 8px 0 0;
+            cursor: move;
+            user-select: none;
+        }
+
+        #notebook-header-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .notebook-window-controls {
+            display: flex;
+            gap: 8px;
+        }
+
+        .notebook-window-btn {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            border: none;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        .notebook-window-btn:hover {
+            opacity: 0.8;
+        }
+
+        .notebook-window-btn.close {
+            background: #ff5f56;
+        }
+
+        .notebook-window-btn.restore {
+            background: #ffbd2e;
+        }
+
+        .notebook-window-btn.maximize {
+            background: #27c93f;
+        }
+
+        #notebook-header h2 {
+            font-size: 13px;
+            color: #8b949e;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        #notebook-header h2 svg {
+            width: 14px;
+            height: 14px;
+            fill: #58a6ff;
+        }
+
+        .notebook-header-btns {
+            display: flex;
+            gap: 8px;
+        }
+
+        .notebook-btn {
+            background: #21262d;
+            border: 1px solid #30363d;
+            color: #8b949e;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+        }
+
+        .notebook-btn:hover {
+            background: #30363d;
+            color: #e0e0e0;
+        }
+
+        .notebook-btn.primary {
+            background: #238636;
+            border-color: #238636;
+            color: white;
+        }
+
+        .notebook-btn.primary:hover {
+            background: #2ea043;
+        }
+
+        .notebook-btn.danger {
+            background: transparent;
+            border-color: #f85149;
+            color: #f85149;
+        }
+
+        .notebook-btn.danger:hover {
+            background: rgba(248, 81, 73, 0.1);
+        }
+
+        .notebook-btn svg {
+            width: 14px;
+            height: 14px;
+            fill: currentColor;
+        }
+
+
+        /* Tabs */
+        #notebook-tabs {
+            display: flex;
+            align-items: center;
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            padding: 0 8px;
+            overflow-x: auto;
+        }
+
+        #notebook-tabs::-webkit-scrollbar {
+            height: 4px;
+        }
+
+        #notebook-tabs::-webkit-scrollbar-thumb {
+            background: #30363d;
+            border-radius: 2px;
+        }
+
+        .notebook-tab {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 16px;
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: #8b949e;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 12px;
+            white-space: nowrap;
+            transition: all 0.2s;
+        }
+
+        .notebook-tab:hover {
+            color: #e0e0e0;
+            background: rgba(48, 54, 61, 0.5);
+        }
+
+        .notebook-tab.active {
+            color: #58a6ff;
+            border-bottom-color: #58a6ff;
+            background: rgba(88, 166, 255, 0.1);
+        }
+
+        .notebook-tab .tab-modified {
+            width: 8px;
+            height: 8px;
+            background: #f0883e;
+            border-radius: 50%;
+            display: none;
+        }
+
+        .notebook-tab.modified .tab-modified {
+            display: block;
+        }
+
+        .notebook-tab .tab-close {
+            width: 16px;
+            height: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 3px;
+            opacity: 0;
+            transition: all 0.2s;
+        }
+
+        .notebook-tab:hover .tab-close {
+            opacity: 1;
+        }
+
+        .notebook-tab .tab-close:hover {
+            background: rgba(248, 81, 73, 0.2);
+            color: #f85149;
+        }
+
+        .notebook-tab .tab-close svg {
+            width: 12px;
+            height: 12px;
+            fill: currentColor;
+        }
+
+        #notebook-tab-add {
+            padding: 8px;
+            background: transparent;
+            border: none;
+            color: #8b949e;
+            cursor: pointer;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-left: 4px;
+        }
+
+        #notebook-tab-add:hover {
+            background: #30363d;
+            color: #7ee787;
+        }
+
+        #notebook-tab-add svg {
+            width: 16px;
+            height: 16px;
+            fill: currentColor;
+        }
+
+        /* Editor Area */
+        #notebook-editor-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+
+        #notebook-editor {
+            flex: 1;
+            background: #0d1117;
+            border: none;
+            color: #e0e0e0;
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            padding: 16px;
+            resize: none;
+            outline: none;
+            tab-size: 4;
+        }
+
+        #notebook-editor::placeholder {
+            color: #484f58;
+        }
+
+        /* Status Bar */
+        #notebook-status {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 12px;
+            background: #161b22;
+            border-top: 1px solid #30363d;
+            font-size: 11px;
+            color: #8b949e;
+        }
+
+        #notebook-status .status-left {
+            display: flex;
+            gap: 16px;
+        }
+
+        #notebook-status .status-right {
+            display: flex;
+            gap: 16px;
+        }
+
+        /* Save Dialog */
+        .notebook-dialog {
+            display: none;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 20px;
+            z-index: 1001;
+            min-width: 300px;
+        }
+
+        .notebook-dialog.open {
+            display: block;
+        }
+
+        .notebook-dialog h3 {
+            color: #e0e0e0;
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+
+        .notebook-dialog input[type="text"] {
+            width: 100%;
+            background: #21262d;
+            border: 1px solid #30363d;
+            color: #e0e0e0;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 13px;
+        }
+
+        .notebook-dialog input[type="text"]:focus {
+            outline: none;
+            border-color: #58a6ff;
+        }
+
+        .notebook-dialog-btns {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            margin-top: 16px;
+        }
+
+        /* Saved Scripts List */
+        #saved-scripts-list {
+            max-height: 200px;
+            overflow-y: auto;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            margin-top: 8px;
+        }
+
+        .saved-script-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 12px;
+            border-bottom: 1px solid #21262d;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .saved-script-item:last-child {
+            border-bottom: none;
+        }
+
+        .saved-script-item:hover {
+            background: #21262d;
+        }
+
+        .saved-script-item .script-name {
+            color: #58a6ff;
+        }
+
+        .saved-script-item .script-date {
+            color: #6e7681;
+            font-size: 10px;
+        }
+
+        .saved-script-item .script-delete {
+            color: #8b949e;
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+            opacity: 0;
+            transition: all 0.2s;
+        }
+
+        .saved-script-item:hover .script-delete {
+            opacity: 1;
+        }
+
+        .saved-script-item .script-delete:hover {
+            color: #f85149;
+            background: rgba(248, 81, 73, 0.1);
+        }
     </style>
 </head>
 <body>
@@ -305,8 +755,95 @@
             <button class="view-btn" onclick="setSideView()">Side</button>
             <button class="view-btn" onclick="setFrontView()">Front</button>
         </div>
+
+        <!-- Floating Notebook Button -->
+        <button id="notebook-fab" onclick="notebook.open()" title="Open Script Editor">
+            <svg viewBox="0 0 24 24"><path d="M14.06 9.02l.92.92L5.92 19H5v-.92l9.06-9.06M17.66 3c-.25 0-.51.1-.7.29l-1.83 1.83 3.75 3.75 1.83-1.83c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.2-.2-.45-.29-.71-.29zm-3.6 3.19L3 17.25V21h3.75L17.81 9.94l-3.75-3.75z"/></svg>
+        </button>
+    </div>
+
+    <!-- Notebook Window -->
+    <div id="notebook-modal">
+        <div id="notebook-container">
+            <div id="notebook-header">
+                <div id="notebook-header-left">
+                    <div class="notebook-window-controls">
+                        <button class="notebook-window-btn close" onclick="notebook.close()" title="Close"></button>
+                        <button class="notebook-window-btn restore" onclick="notebook.restore()" title="Restore"></button>
+                        <button class="notebook-window-btn maximize" onclick="notebook.maximize()" title="Maximize"></button>
+                    </div>
+                    <h2>
+                        <svg viewBox="0 0 24 24"><path d="M14.06 9.02l.92.92L5.92 19H5v-.92l9.06-9.06M17.66 3c-.25 0-.51.1-.7.29l-1.83 1.83 3.75 3.75 1.83-1.83c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.2-.2-.45-.29-.71-.29zm-3.6 3.19L3 17.25V21h3.75L17.81 9.94l-3.75-3.75z"/></svg>
+                        Script Editor
+                    </h2>
+                </div>
+                <div class="notebook-header-btns">
+                    <button class="notebook-btn" onclick="notebook.showLoad()">
+                        <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                        Load
+                    </button>
+                    <button class="notebook-btn" onclick="notebook.showSave()">
+                        <svg viewBox="0 0 24 24"><path d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/></svg>
+                        Save
+                    </button>
+                    <button class="notebook-btn primary" onclick="notebook.run()">
+                        <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                        Run
+                    </button>
+                </div>
+            </div>
+            <div id="notebook-tabs">
+                <!-- Tabs will be generated dynamically -->
+                <button id="notebook-tab-add" onclick="notebook.newTab()" title="New Tab">
+                    <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+                </button>
+            </div>
+            <div id="notebook-editor-container">
+                <textarea id="notebook-editor" placeholder="# Write your robot arm script here...
+# Example:
+spawn cube 100 150 0
+wait 500
+goto 100 150 50
+goto 100 150 5
+close
+wait 500
+goto 100 150 100
+home" spellcheck="false"></textarea>
+            </div>
+            <div id="notebook-status">
+                <div class="status-left">
+                    <span id="notebook-line-count">Lines: 0</span>
+                    <span id="notebook-char-count">Chars: 0</span>
+                </div>
+                <div class="status-right">
+                    <span id="notebook-save-status">Not saved</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Save Dialog -->
+        <div id="save-dialog" class="notebook-dialog">
+            <h3>Save Script</h3>
+            <input type="text" id="save-script-name" placeholder="Enter script name..." spellcheck="false">
+            <div class="notebook-dialog-btns">
+                <button class="notebook-btn" onclick="notebook.hideSave()">Cancel</button>
+                <button class="notebook-btn primary" onclick="notebook.confirmSave()">Save</button>
+            </div>
+        </div>
+
+        <!-- Load Dialog -->
+        <div id="load-dialog" class="notebook-dialog">
+            <h3>Load Script</h3>
+            <div id="saved-scripts-list">
+                <!-- Scripts will be listed here -->
+            </div>
+            <div class="notebook-dialog-btns">
+                <button class="notebook-btn" onclick="notebook.hideLoad()">Cancel</button>
+            </div>
+        </div>
     </div>
     <div id="terminal-panel">
+        <div id="terminal-resize-handle"></div>
         <div id="terminal-header">
             <span class="terminal-dot dot-red"></span>
             <span class="terminal-dot dot-yellow"></span>

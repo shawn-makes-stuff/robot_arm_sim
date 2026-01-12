@@ -375,20 +375,9 @@ function createRobotArm() {
     loader.load(
         'robot_arm.glb',
         (gltf) => {
-            console.log('GLB loaded successfully');
-            console.log('Scene structure:', gltf.scene);
-
-            // Log all objects in the GLB for debugging
-            gltf.scene.traverse((child) => {
-                console.log('Found object:', child.name, child.type);
-            });
-
-            // Setup the robot arm from the loaded model
             setupRobotArmFromGLB(gltf.scene);
         },
-        (progress) => {
-            console.log('Loading progress:', (progress.loaded / progress.total * 100).toFixed(1) + '%');
-        },
+        undefined,
         (error) => {
             console.error('Error loading GLB:', error);
             // Fallback to procedural arm if GLB fails to load
@@ -470,16 +459,6 @@ function setupRobotArmFromGLB(glbScene) {
     const leftFingerPart = findPart(['left', 'finger_l', 'claw_l']);
     const rightFingerPart = findPart(['right', 'finger_r', 'claw_r']);
 
-    console.log('Found parts:', {
-        base: basePart?.name,
-        shoulder: shoulderPart?.name,
-        elbow: elbowPart?.name,
-        wrist: wristPart?.name,
-        gripper: gripperPart?.name,
-        leftFinger: leftFingerPart?.name,
-        rightFinger: rightFingerPart?.name
-    });
-
     // Apply custom materials and enable shadows on all meshes
     glbScene.traverse((child) => {
         if (child.isMesh) {
@@ -515,8 +494,6 @@ function setupRobotArmFromGLB(glbScene) {
     // Check if the GLB has a proper hierarchy we can use directly
     // If parts are already nested properly in Blender, we use them directly
     if (basePart && basePart.children.length > 0) {
-        // The model has a nested hierarchy - use it directly
-        console.log('Using GLB hierarchy directly');
 
         // Add the whole scene at the base position
         glbScene.position.y = 0;
@@ -553,8 +530,6 @@ function setupRobotArmFromGLB(glbScene) {
         }
 
     } else {
-        // The model is flat - we need to create our own hierarchy
-        console.log('Creating hierarchy from flat GLB');
         createHierarchyFromFlatGLB(glbScene, basePart, shoulderPart, elbowPart, wristPart, gripperPart, leftFingerPart, rightFingerPart);
     }
 
@@ -578,8 +553,6 @@ function setupRobotArmFromGLB(glbScene) {
 
     // Collect all meshes for collision detection
     collectRobotArmMeshes(glbScene);
-
-    console.log('Robot arm setup complete:', robotArm);
 }
 
 // Collect all meshes from the robot arm for mesh-based collision detection
@@ -613,12 +586,6 @@ function collectRobotArmMeshes(glbScene) {
                 }
             }
         }
-    });
-
-    console.log('Collected meshes for collision:', {
-        total: robotArmMeshes.length,
-        leftGripper: gripperMeshes.left.length,
-        rightGripper: gripperMeshes.right.length
     });
 }
 
@@ -746,8 +713,6 @@ function ensurePivotStructure() {
 
 // Fallback procedural arm if GLB fails to load
 function createProceduralRobotArm() {
-    console.log('Creating fallback procedural robot arm');
-
     // Materials
     const baseMaterial = new THREE.MeshStandardMaterial({
         color: CONFIG.colors.base,
@@ -1146,9 +1111,6 @@ function getArmJointPositions() {
 // 4. Predictive detection - Check BEFORE movement to prevent tunneling
 
 // Raycaster for collision detection
-const collisionRaycaster = new THREE.Raycaster();
-collisionRaycaster.params.Mesh.threshold = 0.001;
-
 // Compute the minimum translation vector (MTV) to separate two AABBs
 // Returns { axis: Vector3, depth: number } or null if no overlap
 function computeAABBSeparation(boxA, boxB) {
@@ -1328,26 +1290,6 @@ function checkArmMeshCollision(obj) {
 }
 
 // Get gripper finger positions in world space for collision detection
-function getGripperFingerBounds() {
-    robotArm.leftFinger.updateWorldMatrix(true, true);
-    robotArm.rightFinger.updateWorldMatrix(true, true);
-
-    const leftBox = new THREE.Box3();
-    const rightBox = new THREE.Box3();
-
-    // Get bounds from all meshes in each finger
-    for (const mesh of gripperMeshes.left) {
-        mesh.updateMatrixWorld(true);
-        leftBox.expandByObject(mesh);
-    }
-    for (const mesh of gripperMeshes.right) {
-        mesh.updateMatrixWorld(true);
-        rightBox.expandByObject(mesh);
-    }
-
-    return { left: leftBox, right: rightBox };
-}
-
 // Check distance from a point to a line segment
 function pointToSegmentDistance(point, segStart, segEnd) {
     const line = segEnd.clone().sub(segStart);
@@ -1685,27 +1627,6 @@ function pushObjectsFromArm() {
     }
 }
 
-function checkGripperContact(obj) {
-    const tips = getGripperFingerTips();
-    const objPos = obj.mesh.position;
-    const radius = obj.getRadius();
-
-    // Distance from each finger tip to object center
-    const leftDist = tips.left.distanceTo(objPos);
-    const rightDist = tips.right.distanceTo(objPos);
-
-    // Contact threshold: object radius + finger pad width
-    const contactThreshold = radius + 0.025;
-
-    return {
-        leftContact: leftDist < contactThreshold,
-        rightContact: rightDist < contactThreshold,
-        bothContact: leftDist < contactThreshold && rightDist < contactThreshold,
-        leftDist: leftDist,
-        rightDist: rightDist
-    };
-}
-
 // Check collision between gripper finger surfaces and object
 // Returns collision info including minimum openness to avoid penetration
 function checkGripperFingerCollision(obj) {
@@ -1884,34 +1805,6 @@ function isObjectInGripZone(obj) {
 
     // All conditions must be met for proper grip zone
     return isCentered && fitsInGripper && inYRange && inZRange && betweenFingers;
-}
-
-function applyGripperPush(obj, collision) {
-    if (obj.isGripped) return;
-    // Only push if there's single-finger contact (not gripping from both sides)
-    if (!collision.leftContact && !collision.rightContact) return;
-    if (collision.bothContact) return;  // Both fingers touching = gripping, not pushing
-    // Don't push if gripper is mostly open (releasing, not gripping)
-    if (gripperOpenness > 50) return;
-
-    // Get gripper's local X axis in world space for push direction
-    robotArm.gripperGroup.updateWorldMatrix(true, false);
-    const gripperXAxis = new THREE.Vector3(1, 0, 0);
-    gripperXAxis.applyQuaternion(robotArm.gripperGroup.getWorldQuaternion(new THREE.Quaternion()));
-
-    // If only one finger touching, push away from that finger
-    if (collision.leftContact && !collision.rightContact) {
-        // Push in positive X direction (away from left finger)
-        const pushDir = gripperXAxis.clone();
-        obj.mesh.position.add(pushDir.multiplyScalar(0.01));
-        obj.velocity.add(gripperXAxis.clone().multiplyScalar(0.3));
-    }
-    if (collision.rightContact && !collision.leftContact) {
-        // Push in negative X direction (away from right finger)
-        const pushDir = gripperXAxis.clone().negate();
-        obj.mesh.position.add(pushDir.multiplyScalar(0.01));
-        obj.velocity.add(gripperXAxis.clone().multiplyScalar(-0.3));
-    }
 }
 
 function gripObject(obj) {
@@ -2481,27 +2374,6 @@ function applyAnglesSet(angles) {
 
 // Check collision at a specific set of angles without permanently applying
 // Returns collision info if blocked, otherwise { collision: false }
-function checkCollisionAtAngles(angles) {
-    // Temporarily apply angles
-    const saved = { ...jointAngles };
-    applyAnglesSet(angles);
-
-    // Update world matrices for accurate collision detection
-    if (robotArm.basePivot) {
-        robotArm.basePivot.updateMatrixWorld(true);
-    }
-
-    // Check collision
-    const collision = checkArmCollisionWithBlockedObject();
-
-    // Restore original angles
-    applyAnglesSet(saved);
-
-    return collision;
-}
-
-
-
 function updateAnimation() {
     if (!isAnimating) return;
 

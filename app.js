@@ -51,6 +51,8 @@ const CONFIG = {
 
 let scene, camera, renderer, controls;
 let robotArm = {};
+let robotArmMeshes = [];  // All meshes in the robot arm for collision detection
+let gripperMeshes = { left: [], right: [] };  // Gripper finger meshes specifically
 let isAnimating = false;
 let animationQueue = [];
 let commandHistory = [];
@@ -204,12 +206,16 @@ function initScene() {
 }
 
 function setupLighting() {
-    // Ambient light
-    const ambient = new THREE.AmbientLight(0x404040, 0.5);
+    // Hemisphere light for natural sky/ground illumination (great for metallic materials)
+    const hemiLight = new THREE.HemisphereLight(0x87ceeb, 0x362f2f, 0.42);  // Reduced 30%
+    scene.add(hemiLight);
+
+    // Ambient light - slightly increased for better fill
+    const ambient = new THREE.AmbientLight(0x404050, 0.4);
     scene.add(ambient);
 
-    // Main directional light
-    const mainLight = new THREE.DirectionalLight(0xffffff, 1);
+    // Main directional light - increased intensity
+    const mainLight = new THREE.DirectionalLight(0xffffff, 1.2);
     mainLight.position.set(5, 10, 5);
     mainLight.castShadow = true;
     mainLight.shadow.mapSize.width = 2048;
@@ -223,18 +229,23 @@ function setupLighting() {
     mainLight.shadow.bias = -0.0001;
     scene.add(mainLight);
 
-    // Fill light
-    const fillLight = new THREE.DirectionalLight(0x4a90d9, 0.3);
+    // Fill light - increased for better shadow fill
+    const fillLight = new THREE.DirectionalLight(0x4a90d9, 0.5);
     fillLight.position.set(-5, 5, -5);
     scene.add(fillLight);
 
-    // Rim light
-    const rimLight = new THREE.DirectionalLight(0xff6b6b, 0.2);
+    // Back/rim light for edge definition
+    const rimLight = new THREE.DirectionalLight(0xffffff, 0.4);
     rimLight.position.set(0, 5, -10);
     scene.add(rimLight);
 
-    // Point light near base
-    const pointLight = new THREE.PointLight(0x63b3ed, 0.5, 10);
+    // Front fill light for the arm
+    const frontLight = new THREE.DirectionalLight(0xe0e0ff, 0.3);
+    frontLight.position.set(0, 3, 8);
+    scene.add(frontLight);
+
+    // Point light near base - slightly increased
+    const pointLight = new THREE.PointLight(0x63b3ed, 0.6, 10);
     pointLight.position.set(0, 0.5, 0);
     scene.add(pointLight);
 }
@@ -358,6 +369,385 @@ function createTextLabel(text, color = '#ffffff', fontSize = 32) {
 // ============================================================================
 
 function createRobotArm() {
+    // Load the custom GLB model
+    const loader = new THREE.GLTFLoader();
+
+    loader.load(
+        'robot_arm.glb',
+        (gltf) => {
+            console.log('GLB loaded successfully');
+            console.log('Scene structure:', gltf.scene);
+
+            // Log all objects in the GLB for debugging
+            gltf.scene.traverse((child) => {
+                console.log('Found object:', child.name, child.type);
+            });
+
+            // Setup the robot arm from the loaded model
+            setupRobotArmFromGLB(gltf.scene);
+        },
+        (progress) => {
+            console.log('Loading progress:', (progress.loaded / progress.total * 100).toFixed(1) + '%');
+        },
+        (error) => {
+            console.error('Error loading GLB:', error);
+            // Fallback to procedural arm if GLB fails to load
+            createProceduralRobotArm();
+        }
+    );
+}
+
+function setupRobotArmFromGLB(glbScene) {
+    // Create our custom materials matching the original style
+    const materials = {
+        base: new THREE.MeshStandardMaterial({
+            color: CONFIG.colors.base,
+            roughness: 0.3,
+            metalness: 0.8
+        }),
+        shoulder: new THREE.MeshStandardMaterial({
+            color: CONFIG.colors.wrist,  // Light blue like wrist
+            roughness: 0.4,
+            metalness: 0.5
+        }),
+        elbow: new THREE.MeshStandardMaterial({
+            color: CONFIG.colors.elbow,
+            roughness: 0.4,
+            metalness: 0.6
+        }),
+        wrist: new THREE.MeshStandardMaterial({
+            color: CONFIG.colors.wrist,
+            roughness: 0.4,
+            metalness: 0.5
+        }),
+        joint: new THREE.MeshStandardMaterial({
+            color: CONFIG.colors.elbow,  // Silvery gray like lower arm
+            roughness: 0.3,
+            metalness: 0.7
+        }),
+        effector: new THREE.MeshStandardMaterial({
+            color: CONFIG.colors.effector,
+            roughness: 0.3,
+            metalness: 0.5,
+            emissive: CONFIG.colors.effector,
+            emissiveIntensity: 0.2
+        }),
+        gripper: new THREE.MeshStandardMaterial({
+            color: 0xe53e3e,
+            roughness: 0.3,
+            metalness: 0.7
+        }),
+        gripperPad: new THREE.MeshStandardMaterial({
+            color: 0x1a1a1a,  // Black
+            roughness: 0.8,
+            metalness: 0.1
+        })
+    };
+
+    // Find parts by name (case-insensitive search)
+    function findPart(names) {
+        let found = null;
+        const searchNames = Array.isArray(names) ? names : [names];
+        glbScene.traverse((child) => {
+            if (found) return;
+            const childName = child.name.toLowerCase();
+            for (const name of searchNames) {
+                if (childName.includes(name.toLowerCase())) {
+                    found = child;
+                    break;
+                }
+            }
+        });
+        return found;
+    }
+
+    // Try to find the main parts
+    const basePart = findPart(['base', 'platform', 'bottom']);
+    const shoulderPart = findPart(['shoulder', 'upper_arm', 'upperarm', 'arm1']);
+    const elbowPart = findPart(['elbow', 'lower_arm', 'lowerarm', 'forearm', 'arm2']);
+    const wristPart = findPart(['wrist', 'hand']);
+    const gripperPart = findPart(['gripper', 'claw', 'effector']);
+    const leftFingerPart = findPart(['left', 'finger_l', 'claw_l']);
+    const rightFingerPart = findPart(['right', 'finger_r', 'claw_r']);
+
+    console.log('Found parts:', {
+        base: basePart?.name,
+        shoulder: shoulderPart?.name,
+        elbow: elbowPart?.name,
+        wrist: wristPart?.name,
+        gripper: gripperPart?.name,
+        leftFinger: leftFingerPart?.name,
+        rightFinger: rightFingerPart?.name
+    });
+
+    // Apply custom materials and enable shadows on all meshes
+    glbScene.traverse((child) => {
+        if (child.isMesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+
+            // Apply material based on object name
+            // Note: Check order matters - more specific matches (like "joint") come before general ones (like "shoulder")
+            const name = child.name.toLowerCase();
+            if (name.includes('base') || name.includes('platform') || name.includes('bottom')) {
+                child.material = materials.base;
+            } else if (name.includes('joint')) {
+                child.material = materials.joint;
+            } else if (name.includes('shoulder') || name.includes('upper')) {
+                child.material = materials.shoulder;
+            } else if (name.includes('elbow') || name.includes('lower') || name.includes('forearm')) {
+                child.material = materials.elbow;
+            } else if (name.includes('wrist') || name.includes('hand')) {
+                child.material = materials.wrist;
+            } else if (name.includes('pad')) {
+                child.material = materials.gripperPad;
+            } else if (name.includes('gripper') || name.includes('claw') || name.includes('finger') || name.includes('left') || name.includes('right')) {
+                child.material = materials.gripper;
+            } else if (name.includes('effector')) {
+                child.material = materials.effector;
+            } else {
+                // Default material for unnamed parts
+                child.material = materials.shoulder;
+            }
+        }
+    });
+
+    // Check if the GLB has a proper hierarchy we can use directly
+    // If parts are already nested properly in Blender, we use them directly
+    if (basePart && basePart.children.length > 0) {
+        // The model has a nested hierarchy - use it directly
+        console.log('Using GLB hierarchy directly');
+
+        // Add the whole scene at the base position
+        glbScene.position.y = 0;
+        scene.add(glbScene);
+
+        // Map parts to our robotArm structure based on hierarchy
+        robotArm.basePivot = basePart;
+
+        // Find shoulder pivot (first rotatable joint after base)
+        robotArm.shoulderPivot = shoulderPart || findChildByType(basePart, 'pivot', 'shoulder');
+
+        // Find elbow pivot
+        if (robotArm.shoulderPivot) {
+            robotArm.elbowPivot = elbowPart || findChildByType(robotArm.shoulderPivot, 'pivot', 'elbow');
+        }
+
+        // Find wrist pivot
+        if (robotArm.elbowPivot) {
+            robotArm.wristPivot = wristPart || findChildByType(robotArm.elbowPivot, 'pivot', 'wrist');
+        }
+
+        // Find wrist rotate pivot (for roll)
+        if (robotArm.wristPivot) {
+            robotArm.wristRotatePivot = findChildByType(robotArm.wristPivot, 'pivot', 'rotate') || robotArm.wristPivot;
+        }
+
+        // Find gripper group
+        robotArm.gripperGroup = gripperPart || findChildByType(robotArm.wristRotatePivot || robotArm.wristPivot, 'group', 'gripper');
+
+        // Find fingers
+        if (robotArm.gripperGroup) {
+            robotArm.leftFinger = leftFingerPart || findChildByType(robotArm.gripperGroup, 'group', 'left');
+            robotArm.rightFinger = rightFingerPart || findChildByType(robotArm.gripperGroup, 'group', 'right');
+        }
+
+    } else {
+        // The model is flat - we need to create our own hierarchy
+        console.log('Creating hierarchy from flat GLB');
+        createHierarchyFromFlatGLB(glbScene, basePart, shoulderPart, elbowPart, wristPart, gripperPart, leftFingerPart, rightFingerPart);
+    }
+
+    // If we couldn't find pivots, create empty groups at expected positions
+    ensurePivotStructure();
+
+    // Create end effector marker at gripper tip
+    robotArm.endEffectorMarker = new THREE.Object3D();
+    robotArm.endEffectorMarker.position.y = CONFIG.segments.gripperLength;
+    if (robotArm.gripperGroup) {
+        robotArm.gripperGroup.add(robotArm.endEffectorMarker);
+    } else if (robotArm.wristRotatePivot) {
+        robotArm.wristRotatePivot.add(robotArm.endEffectorMarker);
+    }
+
+    // Initial position
+    setJointAngles(180, -20, 90, 45, false);
+
+    // Initialize gripper
+    applyGripperOpenness();
+
+    // Collect all meshes for collision detection
+    collectRobotArmMeshes(glbScene);
+
+    console.log('Robot arm setup complete:', robotArm);
+}
+
+// Collect all meshes from the robot arm for mesh-based collision detection
+function collectRobotArmMeshes(glbScene) {
+    robotArmMeshes = [];
+    gripperMeshes = { left: [], right: [] };
+
+    glbScene.traverse((child) => {
+        if (child.isMesh) {
+            robotArmMeshes.push(child);
+
+            // Categorize gripper meshes
+            const name = child.name.toLowerCase();
+            if (name.includes('left') || name.includes('finger_l') || name.includes('claw_l')) {
+                gripperMeshes.left.push(child);
+            } else if (name.includes('right') || name.includes('finger_r') || name.includes('claw_r')) {
+                gripperMeshes.right.push(child);
+            } else if (name.includes('pad')) {
+                // Check parent to determine which finger the pad belongs to
+                let parent = child.parent;
+                while (parent) {
+                    const parentName = parent.name.toLowerCase();
+                    if (parentName.includes('left')) {
+                        gripperMeshes.left.push(child);
+                        break;
+                    } else if (parentName.includes('right')) {
+                        gripperMeshes.right.push(child);
+                        break;
+                    }
+                    parent = parent.parent;
+                }
+            }
+        }
+    });
+
+    console.log('Collected meshes for collision:', {
+        total: robotArmMeshes.length,
+        leftGripper: gripperMeshes.left.length,
+        rightGripper: gripperMeshes.right.length
+    });
+}
+
+function findChildByType(parent, type, namePart) {
+    if (!parent) return null;
+    for (const child of parent.children) {
+        const childName = child.name.toLowerCase();
+        if (childName.includes(namePart.toLowerCase())) {
+            return child;
+        }
+    }
+    return null;
+}
+
+function createHierarchyFromFlatGLB(glbScene, basePart, shoulderPart, elbowPart, wristPart, gripperPart, leftFingerPart, rightFingerPart) {
+    // Create pivot groups and attach visual parts
+
+    // Base pivot
+    robotArm.basePivot = new THREE.Group();
+    robotArm.basePivot.position.y = 0.15;
+    scene.add(robotArm.basePivot);
+
+    if (basePart) {
+        basePart.position.set(0, 0, 0);
+        scene.add(basePart);
+    }
+
+    // Shoulder pivot
+    robotArm.shoulderPivot = new THREE.Group();
+    robotArm.shoulderPivot.position.y = CONFIG.segments.baseHeight;
+    robotArm.basePivot.add(robotArm.shoulderPivot);
+
+    if (shoulderPart) {
+        shoulderPart.position.set(0, 0, 0);
+        robotArm.shoulderPivot.add(shoulderPart);
+    }
+
+    // Elbow pivot
+    robotArm.elbowPivot = new THREE.Group();
+    robotArm.elbowPivot.position.y = CONFIG.segments.shoulderLength;
+    robotArm.shoulderPivot.add(robotArm.elbowPivot);
+
+    if (elbowPart) {
+        elbowPart.position.set(0, 0, 0);
+        robotArm.elbowPivot.add(elbowPart);
+    }
+
+    // Wrist pivot
+    robotArm.wristPivot = new THREE.Group();
+    robotArm.wristPivot.position.y = CONFIG.segments.elbowLength;
+    robotArm.elbowPivot.add(robotArm.wristPivot);
+
+    if (wristPart) {
+        wristPart.position.set(0, 0, 0);
+        robotArm.wristPivot.add(wristPart);
+    }
+
+    // Wrist rotate pivot
+    robotArm.wristRotatePivot = new THREE.Group();
+    robotArm.wristRotatePivot.position.y = CONFIG.segments.wristLength;
+    robotArm.wristPivot.add(robotArm.wristRotatePivot);
+
+    // Gripper group
+    robotArm.gripperGroup = new THREE.Group();
+    robotArm.gripperGroup.position.y = 0.06;
+    robotArm.wristRotatePivot.add(robotArm.gripperGroup);
+
+    if (gripperPart) {
+        gripperPart.position.set(0, 0, 0);
+        robotArm.gripperGroup.add(gripperPart);
+    }
+
+    // Fingers
+    if (leftFingerPart) {
+        robotArm.leftFinger = leftFingerPart;
+        robotArm.leftFinger.position.x = -0.05;
+        robotArm.gripperGroup.add(robotArm.leftFinger);
+    }
+
+    if (rightFingerPart) {
+        robotArm.rightFinger = rightFingerPart;
+        robotArm.rightFinger.position.x = 0.05;
+        robotArm.gripperGroup.add(robotArm.rightFinger);
+    }
+}
+
+function ensurePivotStructure() {
+    // Ensure all required pivots exist
+    if (!robotArm.basePivot) {
+        robotArm.basePivot = new THREE.Group();
+        robotArm.basePivot.position.y = 0.15;
+        scene.add(robotArm.basePivot);
+    }
+
+    if (!robotArm.shoulderPivot) {
+        robotArm.shoulderPivot = new THREE.Group();
+        robotArm.shoulderPivot.position.y = CONFIG.segments.baseHeight;
+        robotArm.basePivot.add(robotArm.shoulderPivot);
+    }
+
+    if (!robotArm.elbowPivot) {
+        robotArm.elbowPivot = new THREE.Group();
+        robotArm.elbowPivot.position.y = CONFIG.segments.shoulderLength;
+        robotArm.shoulderPivot.add(robotArm.elbowPivot);
+    }
+
+    if (!robotArm.wristPivot) {
+        robotArm.wristPivot = new THREE.Group();
+        robotArm.wristPivot.position.y = CONFIG.segments.elbowLength;
+        robotArm.elbowPivot.add(robotArm.wristPivot);
+    }
+
+    if (!robotArm.wristRotatePivot) {
+        robotArm.wristRotatePivot = new THREE.Group();
+        robotArm.wristRotatePivot.position.y = CONFIG.segments.wristLength;
+        robotArm.wristPivot.add(robotArm.wristRotatePivot);
+    }
+
+    if (!robotArm.gripperGroup) {
+        robotArm.gripperGroup = new THREE.Group();
+        robotArm.gripperGroup.position.y = 0.06;
+        robotArm.wristRotatePivot.add(robotArm.gripperGroup);
+    }
+}
+
+// Fallback procedural arm if GLB fails to load
+function createProceduralRobotArm() {
+    console.log('Creating fallback procedural robot arm');
+
     // Materials
     const baseMaterial = new THREE.MeshStandardMaterial({
         color: CONFIG.colors.base,
@@ -502,15 +892,14 @@ function createRobotArm() {
     });
 
     // Clamp dimensions
-    const clampLength = CONFIG.segments.gripperLength * 1.0;  // Vertical length
-    const clampWidth = 0.03;   // Thickness (X direction)
-    const clampDepth = 0.08;   // Depth (Z direction)
+    const clampLength = CONFIG.segments.gripperLength * 1.0;
+    const clampWidth = 0.03;
+    const clampDepth = 0.08;
 
     // Left clamp bar
     const leftClampGroup = new THREE.Group();
-    leftClampGroup.position.x = -0.05;  // Initial position
+    leftClampGroup.position.x = -0.05;
 
-    // Main vertical bar
     const leftBar = new THREE.Mesh(
         new THREE.BoxGeometry(clampWidth, clampLength, clampDepth),
         clampMaterial
@@ -519,7 +908,6 @@ function createRobotArm() {
     leftBar.castShadow = true;
     leftClampGroup.add(leftBar);
 
-    // Inner gripping surface (rubber-like pad)
     const leftPad = new THREE.Mesh(
         new THREE.BoxGeometry(0.015, clampLength * 0.7, clampDepth - 0.01),
         clampAccentMaterial
@@ -531,9 +919,8 @@ function createRobotArm() {
 
     // Right clamp bar (mirror)
     const rightClampGroup = new THREE.Group();
-    rightClampGroup.position.x = 0.05;  // Initial position
+    rightClampGroup.position.x = 0.05;
 
-    // Main vertical bar
     const rightBar = new THREE.Mesh(
         new THREE.BoxGeometry(clampWidth, clampLength, clampDepth),
         clampMaterial
@@ -542,7 +929,6 @@ function createRobotArm() {
     rightBar.castShadow = true;
     rightClampGroup.add(rightBar);
 
-    // Inner gripping surface (rubber-like pad)
     const rightPad = new THREE.Mesh(
         new THREE.BoxGeometry(0.015, clampLength * 0.7, clampDepth - 0.01),
         clampAccentMaterial
@@ -556,17 +942,15 @@ function createRobotArm() {
     robotArm.leftFinger = leftClampGroup;
     robotArm.rightFinger = rightClampGroup;
 
-    // Create end effector position marker (at clamp tips)
-    // Clamps extend from y=0 to y=gripperLength, so tip is at gripperLength
+    // Create end effector position marker
     robotArm.endEffectorMarker = new THREE.Object3D();
     robotArm.endEffectorMarker.position.y = CONFIG.segments.gripperLength;
     robotArm.gripperGroup.add(robotArm.endEffectorMarker);
 
-    // Initial position - upright ready stance
-    // Arm reaching up and forward with gripper pointing outward
+    // Initial position
     setJointAngles(180, -20, 90, 45, false);
 
-    // Initialize gripper position (50% open)
+    // Initialize gripper position
     applyGripperOpenness();
 }
 
@@ -748,6 +1132,119 @@ function getArmJointPositions() {
     return positions;
 }
 
+// ============================================================================
+// MESH-BASED COLLISION DETECTION
+// ============================================================================
+
+// Raycaster for collision detection
+const collisionRaycaster = new THREE.Raycaster();
+collisionRaycaster.params.Mesh.threshold = 0.001;
+
+// Check if a mesh intersects with an object using actual geometry
+function checkMeshObjectCollision(meshes, objMesh, tolerance = 0.01) {
+    if (!meshes || meshes.length === 0) return { collision: false };
+
+    // Update matrices
+    objMesh.updateMatrixWorld(true);
+
+    // Get object's bounding box in world space
+    const objBox = new THREE.Box3().setFromObject(objMesh);
+
+    for (const mesh of meshes) {
+        mesh.updateMatrixWorld(true);
+
+        // Get mesh's bounding box in world space
+        const meshBox = new THREE.Box3().setFromObject(mesh);
+
+        // Expand mesh box by tolerance for more reliable contact detection
+        meshBox.expandByScalar(tolerance);
+
+        // Check bounding box intersection
+        if (meshBox.intersectsBox(objBox)) {
+            // Calculate penetration depth (accounting for tolerance)
+            const intersection = meshBox.clone().intersect(objBox);
+            const size = new THREE.Vector3();
+            intersection.getSize(size);
+            const penetration = Math.max(0, Math.min(size.x, size.y, size.z) - tolerance);
+
+            return {
+                collision: true,
+                mesh: mesh,
+                penetration: penetration,
+                intersectionBox: intersection
+            };
+        }
+    }
+
+    return { collision: false };
+}
+
+// Check collision between gripper fingers and an object using actual mesh geometry
+function checkGripperMeshCollision(obj) {
+    const objMesh = obj.mesh;
+
+    // Check left finger collision
+    const leftCollision = checkMeshObjectCollision(gripperMeshes.left, objMesh);
+
+    // Check right finger collision
+    const rightCollision = checkMeshObjectCollision(gripperMeshes.right, objMesh);
+
+    return {
+        collision: leftCollision.collision || rightCollision.collision,
+        leftContact: leftCollision.collision,
+        rightContact: rightCollision.collision,
+        bothContact: leftCollision.collision && rightCollision.collision,
+        leftPenetration: leftCollision.penetration || 0,
+        rightPenetration: rightCollision.penetration || 0
+    };
+}
+
+// Check collision between any robot arm mesh and an object
+function checkArmMeshCollision(obj) {
+    const objMesh = obj.mesh;
+    objMesh.updateMatrixWorld(true);
+
+    // Get object's bounding box
+    const objBox = new THREE.Box3().setFromObject(objMesh);
+
+    let closestCollision = null;
+    let minPenetration = Infinity;
+
+    for (const mesh of robotArmMeshes) {
+        // Skip gripper meshes (handled separately)
+        const name = mesh.name.toLowerCase();
+        if (name.includes('left') || name.includes('right') || name.includes('pad') ||
+            name.includes('finger') || name.includes('claw') || name.includes('gripper')) {
+            continue;
+        }
+
+        mesh.updateMatrixWorld(true);
+        const meshBox = new THREE.Box3().setFromObject(mesh);
+
+        if (meshBox.intersectsBox(objBox)) {
+            const intersection = meshBox.clone().intersect(objBox);
+            const size = new THREE.Vector3();
+            intersection.getSize(size);
+            const penetration = Math.min(size.x, size.y, size.z);
+
+            if (penetration < minPenetration) {
+                minPenetration = penetration;
+                closestCollision = {
+                    collision: true,
+                    mesh: mesh,
+                    penetration: penetration,
+                    point: new THREE.Vector3().addVectors(
+                        intersection.min,
+                        intersection.max
+                    ).multiplyScalar(0.5)
+                };
+            }
+        }
+    }
+
+    return closestCollision || { collision: false };
+}
+
 // Check distance from a point to a line segment
 function pointToSegmentDistance(point, segStart, segEnd) {
     const line = segEnd.clone().sub(segStart);
@@ -851,25 +1348,41 @@ function checkArmCollisionWithBlockedObject() {
     for (const obj of sceneObjects) {
         if (obj.isGripped) continue;
 
+        // Use simplified collision for reliable detection
         const collision = checkArmObjectCollision(obj);
-        if (!collision.collision) continue;
 
         const objPos = obj.mesh.position;
         const halfHeight = obj.getHalfHeight();
+        const radius = obj.getRadius();
 
         // Check if object is on the floor
-        const onFloor = objPos.y <= halfHeight + 0.01;
+        const onFloor = objPos.y <= halfHeight + 0.02;
+
+        // Also check gripper tips directly pushing down on object
+        const gripperCenter = getGripperCenter();
+        const gripperAboveObject = gripperCenter.y > objPos.y + halfHeight;
+        const gripperOverObject = Math.abs(gripperCenter.x - objPos.x) < radius + 0.05 &&
+                                   Math.abs(gripperCenter.z - objPos.z) < radius + 0.05;
+        const gripperPushingDown = gripperAboveObject && gripperOverObject &&
+                                    (gripperCenter.y - (objPos.y + halfHeight)) < 0.05;
+
+        // If gripper is directly pushing down on a floor object, block it
+        if (onFloor && gripperPushingDown) {
+            return { collision: true, object: obj, info: { segment: { name: 'gripper' }, penetration: 0.05 } };
+        }
+
+        if (!collision.collision) continue;
 
         // Check if we're pushing from above (collision point is above object center)
-        const pushingFromAbove = collision.point && collision.point.y > objPos.y + halfHeight * 0.5;
+        const pushingFromAbove = collision.point && collision.point.y > objPos.y;
 
-        // If on floor and being pushed from above, it's blocked
-        if (onFloor && pushingFromAbove && collision.penetration > 0.02) {
+        // If on floor and being pushed from above, it's blocked (lower threshold)
+        if (onFloor && pushingFromAbove && collision.penetration > 0.01) {
             return { collision: true, object: obj, info: collision };
         }
 
         // If significantly penetrating a floor object, also stop
-        if (onFloor && collision.penetration > obj.getRadius() * 0.3) {
+        if (onFloor && collision.penetration > radius * 0.2) {
             return { collision: true, object: obj, info: collision };
         }
     }
@@ -882,6 +1395,7 @@ function pushObjectsFromArm() {
     for (const obj of sceneObjects) {
         if (obj.isGripped) continue;
 
+        // Use simplified collision for reliable detection
         const collision = checkArmObjectCollision(obj);
         if (!collision.collision) continue;
         if (collision.penetration < 0.005) continue;  // Small threshold
@@ -961,11 +1475,11 @@ function checkGripperFingerCollision(obj) {
     const objY = relPos.dot(gripperYAxis);  // Along finger length (negative = toward base)
     const objZ = relPos.dot(gripperZAxis);  // Forward-back
 
-    // Gripper geometry constants
+    // Gripper geometry constants - adjusted for GLB model
     const clampLength = CONFIG.segments.gripperLength;
-    const clampDepth = 0.08;
-    const padInnerOffset = 0.03;  // Distance from finger center to inner pad surface
-    const minOffset = 0.02;
+    const clampDepth = 0.15;  // Increased for more forgiving Z range
+    const padInnerOffset = 0.01;  // Reduced for GLB model compatibility
+    const minOffset = 0.03;
     const maxOffset = 0.12;
 
     // Current finger positions
@@ -1019,14 +1533,14 @@ function checkGripperFingerCollision(obj) {
     let minOpenness = (requiredOffset - minOffset) / (maxOffset - minOffset) * 100;
     minOpenness = Math.max(0, Math.min(100, minOpenness));
 
-    // Contact detection with tolerance
-    const contactThreshold = 0.008;
+    // Contact detection with tolerance - increased for GLB model
+    const contactThreshold = 0.02;
 
-    // Left finger contacts when its inner surface reaches the object's left edge
+    // Left finger contacts when its inner surface reaches the object's edge
     const leftContact = leftFingerInnerX >= objLeftEdge - contactThreshold &&
                         leftFingerInnerX <= objRightEdge + contactThreshold;
 
-    // Right finger contacts when its inner surface reaches the object's right edge
+    // Right finger contacts when its inner surface reaches the object's edge
     const rightContact = rightFingerInnerX <= objRightEdge + contactThreshold &&
                          rightFingerInnerX >= objLeftEdge - contactThreshold;
 
@@ -1044,6 +1558,8 @@ function applyGripperPush(obj, collision) {
     // Only push if there's single-finger contact (not gripping from both sides)
     if (!collision.leftContact && !collision.rightContact) return;
     if (collision.bothContact) return;  // Both fingers touching = gripping, not pushing
+    // Don't push if gripper is mostly open (releasing, not gripping)
+    if (gripperOpenness > 50) return;
 
     // Get gripper's local X axis in world space for push direction
     robotArm.gripperGroup.updateWorldMatrix(true, false);
@@ -1150,13 +1666,13 @@ function updatePhysics(deltaTime) {
                 if (Math.abs(obj.velocity.z) < 0.001) obj.velocity.z = 0;
             }
 
-            // Check for gripper finger collision (push physics for gripping)
+            // Check for gripper finger collision (use simplified geometric detection for reliable gripping)
             const gripperCollision = checkGripperFingerCollision(obj);
             if (gripperCollision.leftContact || gripperCollision.rightContact) {
                 applyGripperPush(obj, gripperCollision);
             }
 
-            // Check for arm segment collision (push objects away from arm)
+            // Check for arm segment collision (use simplified detection for reliable pushing)
             const armCollision = checkArmObjectCollision(obj);
             if (armCollision.collision && armCollision.penetration > 0.005) {
                 const objPos = obj.mesh.position;
@@ -1224,9 +1740,9 @@ function applyGripperOpenness() {
     if (!robotArm.leftFinger || !robotArm.rightFinger) return;
 
     // Map 0-100 to finger X positions
-    // Closed: fingers at ±0.02 (nearly touching)
+    // Closed: fingers at ±0.03 (space for grip pads)
     // Open: fingers at ±0.12 (spread wide)
-    const minOffset = 0.02;
+    const minOffset = 0.03;
     const maxOffset = 0.12;
     const offset = minOffset + (maxOffset - minOffset) * (gripperOpenness / 100);
 
@@ -1237,6 +1753,11 @@ function applyGripperOpenness() {
 // Set gripper openness with animation
 function setGripperOpenness(percent, animated = true) {
     const clampedPercent = Math.max(0, Math.min(100, percent));
+
+    // If opening while holding something, release it immediately
+    if (clampedPercent > gripperOpenness && grippedObject) {
+        releaseObject();
+    }
 
     if (animated) {
         targetGripperOpenness = clampedPercent;
@@ -1494,13 +2015,9 @@ function updateGripperAnimation() {
         // Check for collision with objects along full finger surface
         for (const obj of sceneObjects) {
             if (obj.isGripped) continue;
-            const collision = checkGripperFingerCollision(obj);
 
-            // Check if closing to target would penetrate this object
-            if (collision.minOpenness > 0 && targetGripperOpenness < collision.minOpenness) {
-                // Clamp target to minimum openness that doesn't penetrate
-                targetGripperOpenness = collision.minOpenness;
-            }
+            // Use simplified geometric detection for reliable gripping
+            const collision = checkGripperFingerCollision(obj);
 
             // Check if both fingers are now contacting the object
             if (collision.bothContact) {

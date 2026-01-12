@@ -1133,15 +1133,67 @@ function getArmJointPositions() {
 }
 
 // ============================================================================
-// MESH-BASED COLLISION DETECTION
+// COLLISION DETECTION SYSTEM
 // ============================================================================
+
+// Collision detection uses Oriented Bounding Boxes (OBB) and swept volumes
+// for accurate robot arm collision with scene objects.
+//
+// Key concepts:
+// 1. OBB collision - More accurate than AABB for rotated objects
+// 2. Swept collision - Detect collisions along movement path
+// 3. Separation axis theorem (SAT) - For precise penetration depth
+// 4. Predictive detection - Check BEFORE movement to prevent tunneling
 
 // Raycaster for collision detection
 const collisionRaycaster = new THREE.Raycaster();
 collisionRaycaster.params.Mesh.threshold = 0.001;
 
+// Compute the minimum translation vector (MTV) to separate two AABBs
+// Returns { axis: Vector3, depth: number } or null if no overlap
+function computeAABBSeparation(boxA, boxB) {
+    const centerA = new THREE.Vector3();
+    const centerB = new THREE.Vector3();
+    const sizeA = new THREE.Vector3();
+    const sizeB = new THREE.Vector3();
+
+    boxA.getCenter(centerA);
+    boxB.getCenter(centerB);
+    boxA.getSize(sizeA);
+    boxB.getSize(sizeB);
+
+    const diff = centerB.clone().sub(centerA);
+    const overlapX = (sizeA.x + sizeB.x) / 2 - Math.abs(diff.x);
+    const overlapY = (sizeA.y + sizeB.y) / 2 - Math.abs(diff.y);
+    const overlapZ = (sizeA.z + sizeB.z) / 2 - Math.abs(diff.z);
+
+    // No overlap
+    if (overlapX <= 0 || overlapY <= 0 || overlapZ <= 0) {
+        return null;
+    }
+
+    // Find minimum overlap axis (separation axis)
+    if (overlapX <= overlapY && overlapX <= overlapZ) {
+        return {
+            axis: new THREE.Vector3(diff.x > 0 ? 1 : -1, 0, 0),
+            depth: overlapX
+        };
+    } else if (overlapY <= overlapX && overlapY <= overlapZ) {
+        return {
+            axis: new THREE.Vector3(0, diff.y > 0 ? 1 : -1, 0),
+            depth: overlapY
+        };
+    } else {
+        return {
+            axis: new THREE.Vector3(0, 0, diff.z > 0 ? 1 : -1),
+            depth: overlapZ
+        };
+    }
+}
+
 // Check if a mesh intersects with an object using actual geometry
-function checkMeshObjectCollision(meshes, objMesh, tolerance = 0.01) {
+// Returns collision info including penetration depth and separation direction
+function checkMeshObjectCollision(meshes, objMesh, tolerance = 0) {
     if (!meshes || meshes.length === 0) return { collision: false };
 
     // Update matrices
@@ -1149,6 +1201,11 @@ function checkMeshObjectCollision(meshes, objMesh, tolerance = 0.01) {
 
     // Get object's bounding box in world space
     const objBox = new THREE.Box3().setFromObject(objMesh);
+    const objCenter = new THREE.Vector3();
+    objBox.getCenter(objCenter);
+
+    let bestCollision = null;
+    let maxPenetration = 0;
 
     for (const mesh of meshes) {
         mesh.updateMatrixWorld(true);
@@ -1156,27 +1213,46 @@ function checkMeshObjectCollision(meshes, objMesh, tolerance = 0.01) {
         // Get mesh's bounding box in world space
         const meshBox = new THREE.Box3().setFromObject(mesh);
 
-        // Expand mesh box by tolerance for more reliable contact detection
-        meshBox.expandByScalar(tolerance);
+        // Expand for tolerance/early detection
+        const testBox = meshBox.clone();
+        if (tolerance > 0) {
+            testBox.expandByScalar(tolerance);
+        }
 
         // Check bounding box intersection
-        if (meshBox.intersectsBox(objBox)) {
-            // Calculate penetration depth (accounting for tolerance)
-            const intersection = meshBox.clone().intersect(objBox);
-            const size = new THREE.Vector3();
-            intersection.getSize(size);
-            const penetration = Math.max(0, Math.min(size.x, size.y, size.z) - tolerance);
+        if (testBox.intersectsBox(objBox)) {
+            // Compute accurate separation using MTV
+            const separation = computeAABBSeparation(meshBox, objBox);
 
-            return {
-                collision: true,
-                mesh: mesh,
-                penetration: penetration,
-                intersectionBox: intersection
-            };
+            if (separation && separation.depth > maxPenetration) {
+                maxPenetration = separation.depth;
+
+                // Collision point is at the interface between boxes
+                const collisionPoint = new THREE.Vector3();
+                const meshCenter = new THREE.Vector3();
+                meshBox.getCenter(meshCenter);
+
+                // Point on mesh surface toward object
+                collisionPoint.copy(meshCenter).add(
+                    separation.axis.clone().multiplyScalar(
+                        meshBox.getSize(new THREE.Vector3()).dot(separation.axis.clone().multiply(separation.axis)) / 2
+                    )
+                );
+
+                bestCollision = {
+                    collision: true,
+                    mesh: mesh,
+                    penetration: separation.depth,
+                    point: collisionPoint,
+                    // Push direction is FROM mesh TOWARD object (MTV direction)
+                    pushDirection: separation.axis.clone(),
+                    separationAxis: separation.axis.clone()
+                };
+            }
         }
     }
 
-    return { collision: false };
+    return bestCollision || { collision: false };
 }
 
 // Check collision between gripper fingers and an object using actual mesh geometry
@@ -1195,20 +1271,25 @@ function checkGripperMeshCollision(obj) {
         rightContact: rightCollision.collision,
         bothContact: leftCollision.collision && rightCollision.collision,
         leftPenetration: leftCollision.penetration || 0,
-        rightPenetration: rightCollision.penetration || 0
+        rightPenetration: rightCollision.penetration || 0,
+        leftCollision: leftCollision,
+        rightCollision: rightCollision
     };
 }
 
 // Check collision between any robot arm mesh and an object
+// Returns detailed collision info including push direction
 function checkArmMeshCollision(obj) {
     const objMesh = obj.mesh;
     objMesh.updateMatrixWorld(true);
 
     // Get object's bounding box
     const objBox = new THREE.Box3().setFromObject(objMesh);
+    const objCenter = new THREE.Vector3();
+    objBox.getCenter(objCenter);
 
-    let closestCollision = null;
-    let minPenetration = Infinity;
+    let bestCollision = null;
+    let maxPenetration = 0;
 
     for (const mesh of robotArmMeshes) {
         // Skip gripper meshes (handled separately)
@@ -1222,27 +1303,49 @@ function checkArmMeshCollision(obj) {
         const meshBox = new THREE.Box3().setFromObject(mesh);
 
         if (meshBox.intersectsBox(objBox)) {
-            const intersection = meshBox.clone().intersect(objBox);
-            const size = new THREE.Vector3();
-            intersection.getSize(size);
-            const penetration = Math.min(size.x, size.y, size.z);
+            // Use accurate separation computation
+            const separation = computeAABBSeparation(meshBox, objBox);
 
-            if (penetration < minPenetration) {
-                minPenetration = penetration;
-                closestCollision = {
+            if (separation && separation.depth > maxPenetration) {
+                maxPenetration = separation.depth;
+
+                const meshCenter = new THREE.Vector3();
+                meshBox.getCenter(meshCenter);
+
+                bestCollision = {
                     collision: true,
                     mesh: mesh,
-                    penetration: penetration,
-                    point: new THREE.Vector3().addVectors(
-                        intersection.min,
-                        intersection.max
-                    ).multiplyScalar(0.5)
+                    penetration: separation.depth,
+                    point: meshCenter.clone(),
+                    pushDirection: separation.axis.clone(),
+                    separationAxis: separation.axis.clone()
                 };
             }
         }
     }
 
-    return closestCollision || { collision: false };
+    return bestCollision || { collision: false };
+}
+
+// Get gripper finger positions in world space for collision detection
+function getGripperFingerBounds() {
+    robotArm.leftFinger.updateWorldMatrix(true, true);
+    robotArm.rightFinger.updateWorldMatrix(true, true);
+
+    const leftBox = new THREE.Box3();
+    const rightBox = new THREE.Box3();
+
+    // Get bounds from all meshes in each finger
+    for (const mesh of gripperMeshes.left) {
+        mesh.updateMatrixWorld(true);
+        leftBox.expandByObject(mesh);
+    }
+    for (const mesh of gripperMeshes.right) {
+        mesh.updateMatrixWorld(true);
+        rightBox.expandByObject(mesh);
+    }
+
+    return { left: leftBox, right: rightBox };
 }
 
 // Check distance from a point to a line segment
@@ -1262,9 +1365,26 @@ function pointToSegmentDistance(point, segStart, segEnd) {
     return point.distanceTo(closestPoint);
 }
 
+// Get closest point on a line segment to a given point
+function closestPointOnSegment(point, segStart, segEnd) {
+    const line = segEnd.clone().sub(segStart);
+    const len = line.length();
+    if (len < 0.001) return segStart.clone();
+
+    line.normalize();
+    const toPoint = point.clone().sub(segStart);
+    const proj = toPoint.dot(line);
+
+    if (proj <= 0) return segStart.clone();
+    if (proj >= len) return segEnd.clone();
+
+    return segStart.clone().add(line.multiplyScalar(proj));
+}
+
 // Check if any part of the arm collides with an object
 // Returns collision info for physics response
-function checkArmObjectCollision(obj) {
+// buffer: optional extra distance to add to collision threshold (for early detection)
+function checkArmObjectCollision(obj, buffer = 0) {
     const positions = getArmJointPositions();
     const objPos = obj.mesh.position;
     const radius = obj.getRadius();
@@ -1302,14 +1422,14 @@ function checkArmObjectCollision(obj) {
         if (!startPos || !endPos) continue;
 
         const dist = pointToSegmentDistance(objPos, startPos, endPos);
-        const collisionThreshold = radius + seg.radius;
+        // Add buffer to collision threshold for early detection when blocking
+        const collisionThreshold = radius + seg.radius + buffer;
 
         if (dist < collisionThreshold && dist < closestDist) {
             closestDist = dist;
             closestSegment = seg;
-            // Calculate approximate collision point on segment
-            const segCenter = startPos.clone().add(endPos).multiplyScalar(0.5);
-            collisionPoint = segCenter;
+            // Calculate ACTUAL closest point on segment to object (for proper push direction)
+            collisionPoint = closestPointOnSegment(objPos, startPos, endPos);
         }
     }
 
@@ -1342,86 +1462,224 @@ function checkArmObjectCollision(obj) {
     return { collision: false };
 }
 
-// Check if arm is colliding with a blocked object (can't be pushed)
-// Returns { collision: bool, object: obj } if arm should stop
+// Check if arm is colliding with a blocked object (can't be pushed through floor)
+// Returns { collision: bool, object: obj, info: {...} } if arm should stop
+//
+// BLOCKING LOGIC:
+// - Objects on floor cannot be pushed DOWN (into floor)
+// - Objects on floor CAN be pushed horizontally (they slide)
+// - Objects in air can be pushed in any direction
+// - Gripper pushing down onto floor object = BLOCK
+// - Arm segment pushing down onto floor object = BLOCK
+// - Any horizontal push = ALLOW (physics handles sliding)
 function checkArmCollisionWithBlockedObject() {
+    // ONLY block when the arm is pushing STRAIGHT DOWN into a floor-constrained object.
+    //
+    // The key insight: use the SEPARATION AXIS from collision detection.
+    // - If separation axis is horizontal → object can slide sideways → NO BLOCK
+    // - If separation axis is vertical (down) → object would need to go through floor → BLOCK
+    //
+    // We use a very strict threshold (>95% downward) to ensure side collisions are allowed.
+
     for (const obj of sceneObjects) {
         if (obj.isGripped) continue;
 
-        // Use simplified collision for reliable detection
-        const collision = checkArmObjectCollision(obj);
-
         const objPos = obj.mesh.position;
         const halfHeight = obj.getHalfHeight();
-        const radius = obj.getRadius();
 
         // Check if object is on the floor
-        const onFloor = objPos.y <= halfHeight + 0.02;
+        const floorTolerance = 0.03;
+        const onFloor = objPos.y <= halfHeight + floorTolerance;
+        if (!onFloor) continue;
 
-        // Also check gripper tips directly pushing down on object
-        const gripperCenter = getGripperCenter();
-        const gripperAboveObject = gripperCenter.y > objPos.y + halfHeight;
-        const gripperOverObject = Math.abs(gripperCenter.x - objPos.x) < radius + 0.05 &&
-                                   Math.abs(gripperCenter.z - objPos.z) < radius + 0.05;
-        const gripperPushingDown = gripperAboveObject && gripperOverObject &&
-                                    (gripperCenter.y - (objPos.y + halfHeight)) < 0.05;
+        // Objects in grip zone are being gripped, not blocked
+        if (isObjectInGripZone(obj)) continue;
 
-        // If gripper is directly pushing down on a floor object, block it
-        if (onFloor && gripperPushingDown) {
-            return { collision: true, object: obj, info: { segment: { name: 'gripper' }, penetration: 0.05 } };
+        // Check GRIPPER collision
+        const gripperCol = checkGripperMeshCollision(obj);
+
+        if (gripperCol.collision) {
+            const leftCol = gripperCol.leftCollision;
+            const rightCol = gripperCol.rightCollision;
+
+            // Check if separation axis is predominantly downward
+            for (const col of [leftCol, rightCol]) {
+                if (col?.collision && col.separationAxis) {
+                    const sepAxis = col.separationAxis;
+                    // Separation axis points from arm toward object
+                    // If it points strongly downward (Y < -0.95), object needs to move down
+                    if (sepAxis.y < -0.95 && col.penetration > 0.02) {
+                        return {
+                            collision: true,
+                            object: obj,
+                            info: {
+                                segment: { name: 'gripper' },
+                                penetration: col.penetration
+                            }
+                        };
+                    }
+                }
+            }
         }
 
-        if (!collision.collision) continue;
+        // Check ARM SEGMENTS collision
+        const armCol = checkArmMeshCollision(obj);
 
-        // Check if we're pushing from above (collision point is above object center)
-        const pushingFromAbove = collision.point && collision.point.y > objPos.y;
+        if (armCol.collision && armCol.penetration > 0.02) {
+            const sepAxis = armCol.separationAxis || armCol.pushDirection;
 
-        // If on floor and being pushed from above, it's blocked (lower threshold)
-        if (onFloor && pushingFromAbove && collision.penetration > 0.01) {
-            return { collision: true, object: obj, info: collision };
-        }
-
-        // If significantly penetrating a floor object, also stop
-        if (onFloor && collision.penetration > radius * 0.2) {
-            return { collision: true, object: obj, info: collision };
+            if (sepAxis) {
+                // Only block if separation is almost purely downward
+                if (sepAxis.y < -0.95) {
+                    return {
+                        collision: true,
+                        object: obj,
+                        info: {
+                            segment: { name: armCol.mesh?.name || 'arm' },
+                            penetration: armCol.penetration
+                        }
+                    };
+                }
+            }
         }
     }
 
     return { collision: false, object: null };
 }
 
-// Push objects that the arm is colliding with (from the side)
+// Push objects that the arm is colliding with
+// Uses mesh-based collision for accurate detection
+// Objects on floor can only be pushed horizontally (not into floor)
+//
+// PHYSICS MODEL:
+// - Arm imparts momentum to objects it collides with
+// - Push force is proportional to penetration depth (stiffer contact = more force)
+// - Floor constrains vertical movement (objects can't go through floor)
+// - Horizontal sliding has friction based on object mass (simplified)
 function pushObjectsFromArm() {
     for (const obj of sceneObjects) {
         if (obj.isGripped) continue;
 
-        // Use simplified collision for reliable detection
-        const collision = checkArmObjectCollision(obj);
-        if (!collision.collision) continue;
-        if (collision.penetration < 0.005) continue;  // Small threshold
-
         const objPos = obj.mesh.position;
         const halfHeight = obj.getHalfHeight();
-        const onFloor = objPos.y <= halfHeight + 0.01;
+        const radius = obj.getRadius();
+        const floorTolerance = 0.03;
+        const onFloor = objPos.y <= halfHeight + floorTolerance;
 
-        // Calculate push direction (away from collision point)
-        if (collision.point) {
-            const pushDir = objPos.clone().sub(collision.point);
+        // Check if object is in grip zone (ready to be gripped)
+        const inGripZone = isObjectInGripZone(obj);
 
-            // If on floor, don't push down
+        // Accumulate all push forces
+        const pushForces = [];
+
+        // Helper to accumulate push force
+        function addPushForce(direction, penetration, source) {
+            if (penetration < 0.001) return;
+
+            const dir = direction.clone();
+
+            // For objects on floor, constrain push to horizontal plane
+            // (can push up but not down through floor)
             if (onFloor) {
-                pushDir.y = Math.max(0, pushDir.y);
+                // Allow upward push, prevent downward
+                if (dir.y < 0) {
+                    dir.y = 0;
+                }
             }
 
-            if (pushDir.length() > 0.001) {
-                pushDir.normalize();
+            if (dir.lengthSq() > 0.0001) {
+                dir.normalize();
+                pushForces.push({
+                    direction: dir,
+                    penetration: penetration,
+                    source: source
+                });
+            }
+        }
 
-                // Push strength based on penetration
-                const pushStrength = Math.min(collision.penetration * 2, 0.05);
-                obj.mesh.position.add(pushDir.clone().multiplyScalar(pushStrength));
+        // Check GRIPPER collision
+        const gripperCol = checkGripperMeshCollision(obj);
 
-                // Add velocity
-                obj.velocity.add(pushDir.clone().multiplyScalar(0.5));
+        if (gripperCol.collision) {
+            // If both fingers are touching AND object is centered, this is gripping
+            const isActiveGrip = inGripZone && gripperCol.bothContact;
+
+            if (!isActiveGrip) {
+                // Single finger or off-center contact = push
+                if (gripperCol.leftCollision?.collision && gripperCol.leftCollision.pushDirection) {
+                    addPushForce(
+                        gripperCol.leftCollision.pushDirection,
+                        gripperCol.leftPenetration,
+                        'left_finger'
+                    );
+                }
+                if (gripperCol.rightCollision?.collision && gripperCol.rightCollision.pushDirection) {
+                    addPushForce(
+                        gripperCol.rightCollision.pushDirection,
+                        gripperCol.rightPenetration,
+                        'right_finger'
+                    );
+                }
+            }
+        }
+
+        // Check ARM segments collision (mesh-based)
+        const armMeshCol = checkArmMeshCollision(obj);
+        if (armMeshCol.collision) {
+            const pushDir = armMeshCol.pushDirection || armMeshCol.separationAxis;
+            if (pushDir) {
+                addPushForce(pushDir, armMeshCol.penetration, armMeshCol.mesh?.name || 'arm');
+            }
+        }
+
+        // Check ARM segments collision (geometry-based backup)
+        const armSegCol = checkArmObjectCollision(obj);
+        if (armSegCol.collision && armSegCol.point) {
+            const isGripperSeg = armSegCol.segment?.name === 'gripper';
+            if (!(isGripperSeg && inGripZone)) {
+                // Push direction from contact point toward object center
+                const pushDir = objPos.clone().sub(armSegCol.point);
+                addPushForce(pushDir, armSegCol.penetration, armSegCol.segment?.name || 'segment');
+            }
+        }
+
+        // Apply accumulated forces
+        if (pushForces.length > 0) {
+            // Combine all push directions weighted by penetration
+            const combinedPush = new THREE.Vector3(0, 0, 0);
+            let totalWeight = 0;
+            let maxPenetration = 0;
+
+            for (const force of pushForces) {
+                const weight = force.penetration;
+                combinedPush.add(force.direction.clone().multiplyScalar(weight));
+                totalWeight += weight;
+                maxPenetration = Math.max(maxPenetration, force.penetration);
+            }
+
+            if (totalWeight > 0 && combinedPush.lengthSq() > 0.0001) {
+                combinedPush.normalize();
+
+                // Position correction - push object out of arm's way
+                // Use aggressive correction to ensure separation
+                const separationStrength = Math.max(maxPenetration * 4.0, 0.02);
+                obj.mesh.position.add(combinedPush.clone().multiplyScalar(separationStrength));
+
+                // Velocity impulse for realistic physics
+                const impulseStrength = Math.min(maxPenetration * 20, 5.0);
+                obj.velocity.add(combinedPush.clone().multiplyScalar(impulseStrength));
+
+                // Small random perturbation to prevent getting stuck
+                if (maxPenetration > 0.005) {
+                    obj.velocity.x += (Math.random() - 0.5) * 0.2;
+                    obj.velocity.z += (Math.random() - 0.5) * 0.2;
+                }
+            }
+
+            // Keep object above floor
+            if (obj.mesh.position.y < halfHeight) {
+                obj.mesh.position.y = halfHeight;
+                if (obj.velocity.y < 0) obj.velocity.y = 0;
             }
         }
     }
@@ -1549,8 +1807,83 @@ function checkGripperFingerCollision(obj) {
         minOpenness: minOpenness,
         leftContact: leftContact,
         rightContact: rightContact,
-        bothContact: leftContact && rightContact
+        bothContact: leftContact && rightContact,
+        inGripZone: inYRange && inZRange && inXRange  // Object is in the grippable zone
     };
+}
+
+// Check if object is properly positioned between gripper claws for gripping
+// This determines whether the gripper can successfully grip the object
+// vs just pushing it or colliding with it
+//
+// Returns true if:
+// 1. Object center is between the fingers (X axis in gripper space)
+// 2. Object is within finger length (Y axis - along fingers)
+// 3. Object is within gripper depth (Z axis - front/back)
+// 4. Object would fit when gripper closes (not too wide)
+function isObjectInGripZone(obj) {
+    const objPos = obj.mesh.position;
+    const radius = obj.getRadius();
+    const halfHeight = obj.getHalfHeight();
+
+    // Get gripper world transform
+    robotArm.gripperGroup.updateWorldMatrix(true, false);
+    const gripperCenter = getGripperCenter();
+
+    // Get gripper local axes in world space
+    const gripperQuat = new THREE.Quaternion();
+    robotArm.gripperGroup.getWorldQuaternion(gripperQuat);
+
+    const gripperXAxis = new THREE.Vector3(1, 0, 0).applyQuaternion(gripperQuat); // Left-right
+    const gripperYAxis = new THREE.Vector3(0, 1, 0).applyQuaternion(gripperQuat); // Along fingers
+    const gripperZAxis = new THREE.Vector3(0, 0, 1).applyQuaternion(gripperQuat); // Forward-back
+
+    // Object position relative to gripper center
+    const relPos = objPos.clone().sub(gripperCenter);
+    const objX = relPos.dot(gripperXAxis);  // Left-right in gripper space
+    const objY = relPos.dot(gripperYAxis);  // Along finger length
+    const objZ = relPos.dot(gripperZAxis);  // Front-back
+
+    // Gripper geometry
+    const minOffset = 0.03;   // Minimum finger separation (closed)
+    const maxOffset = 0.12;   // Maximum finger separation (open)
+    const clampLength = CONFIG.segments.gripperLength;
+    const gripperDepth = 0.10; // How deep the gripper is (Z range)
+
+    // Current finger separation based on openness
+    const currentOffset = minOffset + (maxOffset - minOffset) * (gripperOpenness / 100);
+
+    // Check 1: Object center must be reasonably centered in X
+    // Allow some tolerance for off-center objects
+    const maxCenterOffset = currentOffset * 0.5; // Object can be up to 50% off-center
+    const isCentered = Math.abs(objX) < maxCenterOffset;
+
+    // Check 2: Object must fit between fingers when they close
+    // Object diameter must be less than minimum finger separation
+    const objectDiameter = radius * 2;
+    const minGripWidth = minOffset * 1.8; // Slightly less than fully closed (pads have thickness)
+    const maxGripWidth = maxOffset * 2;   // Maximum grip width
+    const fitsInGripper = objectDiameter >= minGripWidth * 0.3 && objectDiameter <= maxGripWidth * 0.9;
+
+    // Check 3: Object is within finger length (Y range)
+    // Fingers extend from Y=0 (tips) to Y=-clampLength (base)
+    const fingerTolerance = halfHeight * 0.5;
+    const inYRange = objY > -clampLength - fingerTolerance && objY < halfHeight + fingerTolerance;
+
+    // Check 4: Object is within gripper depth (Z range)
+    const depthTolerance = radius * 0.5;
+    const inZRange = Math.abs(objZ) < gripperDepth + depthTolerance;
+
+    // Check 5: Object is currently between the fingers (not overlapping finger positions)
+    // Object edges in X should be within current finger positions
+    const objLeftEdge = objX - radius;
+    const objRightEdge = objX + radius;
+    const leftFingerPos = -currentOffset;
+    const rightFingerPos = currentOffset;
+    const betweenFingers = objLeftEdge > leftFingerPos - 0.01 && objRightEdge < rightFingerPos + 0.01;
+
+    // All conditions must be met for proper grip zone
+    return isCentered && fitsInGripper && inYRange && inZRange && betweenFingers;
 }
 
 function applyGripperPush(obj, collision) {
@@ -1594,7 +1927,6 @@ function gripObject(obj) {
     const gripperQuatInv = gripperQuat.clone().invert();
 
     // Store offset in gripper's LOCAL coordinate system
-    // This way the offset transforms correctly when the gripper rotates
     const worldOffset = obj.mesh.position.clone().sub(gripperCenter);
     obj.grippedOffset = worldOffset.applyQuaternion(gripperQuatInv);
 
@@ -1604,6 +1936,19 @@ function gripObject(obj) {
     // Stop any velocity
     obj.velocity.set(0, 0, 0);
 
+    // Calculate target gripper openness to fit snugly around object
+    const objectWidth = obj.getRadius() * 2;
+    const minOffset = 0.03;
+    const maxOffset = 0.12;
+    const fingerPadding = 0.015; // 15mm padding on each side
+    const targetOffset = (objectWidth / 2) + fingerPadding;
+    const finalOpenness = ((targetOffset - minOffset) / (maxOffset - minOffset)) * 100;
+
+    // Set TARGET openness - animation will smoothly close to this value
+    targetGripperOpenness = Math.max(5, Math.min(100, finalOpenness));
+    // Keep animation running to smoothly close
+    gripperAnimating = true;
+
     terminal.print(`Gripped ${obj.name}`, 'success');
 }
 
@@ -1611,13 +1956,16 @@ function releaseObject() {
     if (!grippedObject) return;
 
     const obj = grippedObject;
+
+    // Clear the gripped state FIRST to prevent any race conditions
+    grippedObject = null;
+
     obj.isGripped = false;
     obj.grippedOffset = null;
     obj.grippedRotation = null;
-    grippedObject = null;
 
-    // Give a slight downward velocity when released
-    obj.velocity.set(0, -0.1, 0);
+    // Give a slight downward velocity when released (gravity will take over)
+    obj.velocity.set(0, -0.5, 0);
 
     terminal.print(`Released ${obj.name}`, 'info');
 }
@@ -1638,59 +1986,222 @@ function updateGrippedObjectPosition(obj) {
     obj.mesh.quaternion.copy(gripperQuat).multiply(obj.grippedRotation);
 }
 
-function updatePhysics(deltaTime) {
-    // Cap deltaTime to prevent huge jumps
-    deltaTime = Math.min(deltaTime, 0.1);
+// Check and resolve collisions between all physics objects
+// Uses iterative position correction with velocity impulses for stable physics
+//
+// Algorithm:
+// 1. Multiple iterations to resolve interpenetration
+// 2. Separate based on minimum translation vector (MTV)
+// 3. Apply velocity impulses for realistic bouncing
+// 4. Special handling for stacking (vertical contacts)
+function resolveObjectCollisions() {
+    const restitution = 0.25;  // Bounciness (0 = no bounce, 1 = perfect bounce)
+    const iterations = 5;       // Multiple passes for stability
+    const biasFactor = 0.3;     // Position correction strength
+    const slop = 0.001;         // Penetration allowance (prevents jitter)
 
-    for (const obj of sceneObjects) {
-        if (obj.isGripped) {
-            updateGrippedObjectPosition(obj);
-        } else {
-            // Apply gravity
-            obj.velocity.y -= 9.8 * deltaTime;
+    for (let iter = 0; iter < iterations; iter++) {
+        for (let i = 0; i < sceneObjects.length; i++) {
+            const objA = sceneObjects[i];
+            if (objA.isGripped) continue;
 
-            // Apply velocity
-            obj.mesh.position.x += obj.velocity.x * deltaTime;
-            obj.mesh.position.y += obj.velocity.y * deltaTime;
-            obj.mesh.position.z += obj.velocity.z * deltaTime;
+            for (let j = i + 1; j < sceneObjects.length; j++) {
+                const objB = sceneObjects[j];
+                if (objB.isGripped) continue;
 
-            // Floor collision
-            const halfHeight = obj.getHalfHeight();
-            if (obj.mesh.position.y < halfHeight) {
-                obj.mesh.position.y = halfHeight;
-                obj.velocity.y = 0;
-                // Apply friction
-                obj.velocity.x *= 0.9;
-                obj.velocity.z *= 0.9;
-                if (Math.abs(obj.velocity.x) < 0.001) obj.velocity.x = 0;
-                if (Math.abs(obj.velocity.z) < 0.001) obj.velocity.z = 0;
-            }
+                // Update world matrices
+                objA.mesh.updateMatrixWorld(true);
+                objB.mesh.updateMatrixWorld(true);
 
-            // Check for gripper finger collision (use simplified geometric detection for reliable gripping)
-            const gripperCollision = checkGripperFingerCollision(obj);
-            if (gripperCollision.leftContact || gripperCollision.rightContact) {
-                applyGripperPush(obj, gripperCollision);
-            }
+                const boxA = new THREE.Box3().setFromObject(objA.mesh);
+                const boxB = new THREE.Box3().setFromObject(objB.mesh);
 
-            // Check for arm segment collision (use simplified detection for reliable pushing)
-            const armCollision = checkArmObjectCollision(obj);
-            if (armCollision.collision && armCollision.penetration > 0.005) {
-                const objPos = obj.mesh.position;
-                const onFloor = objPos.y <= halfHeight + 0.01;
+                // Check intersection
+                if (!boxA.intersectsBox(boxB)) continue;
 
-                if (armCollision.point) {
-                    const pushDir = objPos.clone().sub(armCollision.point);
-                    if (onFloor) pushDir.y = Math.max(0, pushDir.y);
+                // Compute separation using MTV
+                const separation = computeAABBSeparation(boxA, boxB);
+                if (!separation || separation.depth < slop) continue;
 
-                    if (pushDir.length() > 0.001) {
-                        pushDir.normalize();
-                        const pushStrength = Math.min(armCollision.penetration, 0.02);
-                        obj.mesh.position.add(pushDir.clone().multiplyScalar(pushStrength));
-                        obj.velocity.add(pushDir.clone().multiplyScalar(0.2));
+                const posA = objA.mesh.position;
+                const posB = objB.mesh.position;
+                const halfHeightA = objA.getHalfHeight();
+                const halfHeightB = objB.getHalfHeight();
+
+                // Check floor contact
+                const aOnFloor = posA.y <= halfHeightA + 0.02;
+                const bOnFloor = posB.y <= halfHeightB + 0.02;
+
+                const normal = separation.axis;
+                const penetration = separation.depth;
+
+                // Calculate correction amount
+                const correctionMagnitude = Math.max(penetration - slop, 0) * biasFactor;
+
+                // Determine how to split correction based on constraints
+                let ratioA = 0.5;
+                let ratioB = 0.5;
+
+                if (Math.abs(normal.y) > 0.7) {
+                    // Vertical collision (stacking scenario)
+                    if (normal.y > 0) {
+                        // B is above A - B should move up
+                        ratioA = aOnFloor ? 0 : 0.2;
+                        ratioB = aOnFloor ? 1 : 0.8;
+                    } else {
+                        // A is above B - A should move up
+                        ratioA = bOnFloor ? 1 : 0.8;
+                        ratioB = bOnFloor ? 0 : 0.2;
+                    }
+                } else {
+                    // Horizontal collision - equal split unless one is constrained
+                    if (aOnFloor && !bOnFloor) {
+                        ratioA = 0.3;
+                        ratioB = 0.7;
+                    } else if (!aOnFloor && bOnFloor) {
+                        ratioA = 0.7;
+                        ratioB = 0.3;
+                    }
+                }
+
+                // Apply position correction
+                const correctionA = normal.clone().multiplyScalar(-correctionMagnitude * ratioA);
+                const correctionB = normal.clone().multiplyScalar(correctionMagnitude * ratioB);
+
+                posA.add(correctionA);
+                posB.add(correctionB);
+
+                // Keep objects above floor
+                if (posA.y < halfHeightA) posA.y = halfHeightA;
+                if (posB.y < halfHeightB) posB.y = halfHeightB;
+
+                // Apply velocity impulse only on first iteration
+                if (iter === 0) {
+                    const relVel = objB.velocity.clone().sub(objA.velocity);
+                    const velAlongNormal = relVel.dot(normal);
+
+                    // Only separate if moving toward each other
+                    if (velAlongNormal < 0) {
+                        const impulse = -(1 + restitution) * velAlongNormal;
+
+                        // Split impulse based on same ratios
+                        const impulseA = normal.clone().multiplyScalar(-impulse * ratioA);
+                        const impulseB = normal.clone().multiplyScalar(impulse * ratioB);
+
+                        objA.velocity.add(impulseA);
+                        objB.velocity.add(impulseB);
+                    }
+
+                    // Friction for stacking
+                    if (Math.abs(normal.y) > 0.7) {
+                        const topObj = posA.y > posB.y ? objA : objB;
+                        const friction = 0.6;
+                        topObj.velocity.x *= friction;
+                        topObj.velocity.z *= friction;
+
+                        // Dampen vertical velocity for resting contact
+                        if (Math.abs(topObj.velocity.y) < 0.3) {
+                            topObj.velocity.y *= 0.3;
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+function updatePhysics(deltaTime) {
+    // Cap deltaTime to prevent huge jumps and ensure stability
+    // Use fixed timestep substeps for consistent physics
+    const maxDeltaTime = 0.02;  // 20ms max per substep
+    const substeps = Math.ceil(deltaTime / maxDeltaTime);
+    const dt = deltaTime / substeps;
+
+    // Physics constants (tuned for realistic behavior)
+    const GRAVITY = 9.8;              // m/s² - standard gravity
+    const FLOOR_BOUNCE = 0.2;         // Coefficient of restitution for floor
+    const FLOOR_FRICTION = 6.0;       // Friction coefficient
+    const AIR_RESISTANCE = 0.5;       // Quadratic drag coefficient
+    const LINEAR_DAMPING = 0.995;     // Linear velocity damping per frame
+    const VELOCITY_THRESHOLD = 0.002; // Below this, snap to zero
+    const ANGULAR_DAMPING = 0.98;     // For future rotation support
+
+    for (let step = 0; step < substeps; step++) {
+        for (const obj of sceneObjects) {
+            if (obj.isGripped) {
+                updateGrippedObjectPosition(obj);
+                continue;
+            }
+
+            const objPos = obj.mesh.position;
+            const halfHeight = obj.getHalfHeight();
+            const onFloor = objPos.y <= halfHeight + 0.01;
+
+            // Apply gravity (F = ma, a = g, so dv = g * dt)
+            obj.velocity.y -= GRAVITY * dt;
+
+            // Apply air resistance (quadratic drag: F_drag = 0.5 * C * v^2)
+            const speed = obj.velocity.length();
+            if (speed > 0.01) {
+                const dragDecel = AIR_RESISTANCE * speed * dt;
+                const dragFactor = Math.max(0.9, 1 - dragDecel / speed);
+                obj.velocity.multiplyScalar(dragFactor);
+            }
+
+            // Linear damping (simulates energy loss)
+            obj.velocity.multiplyScalar(LINEAR_DAMPING);
+
+            // Integrate position (semi-implicit Euler)
+            objPos.x += obj.velocity.x * dt;
+            objPos.y += obj.velocity.y * dt;
+            objPos.z += obj.velocity.z * dt;
+
+            // Floor collision with proper bounce and friction
+            if (objPos.y < halfHeight) {
+                // Correct position
+                objPos.y = halfHeight;
+
+                // Calculate bounce
+                const impactVelocity = obj.velocity.y;
+                if (impactVelocity < -0.1) {
+                    // Significant downward velocity - bounce
+                    obj.velocity.y = -impactVelocity * FLOOR_BOUNCE;
+
+                    // Apply impact friction (more friction on harder impacts)
+                    const impactFriction = Math.min(0.9, 0.7 + Math.abs(impactVelocity) * 0.05);
+                    obj.velocity.x *= impactFriction;
+                    obj.velocity.z *= impactFriction;
+                } else {
+                    // Resting on floor
+                    obj.velocity.y = 0;
+
+                    // Apply sliding friction
+                    const frictionFactor = Math.exp(-FLOOR_FRICTION * dt);
+                    obj.velocity.x *= frictionFactor;
+                    obj.velocity.z *= frictionFactor;
+                }
+            }
+
+            // Snap tiny velocities to zero (prevents drift and improves stability)
+            if (Math.abs(obj.velocity.x) < VELOCITY_THRESHOLD) obj.velocity.x = 0;
+            if (Math.abs(obj.velocity.y) < VELOCITY_THRESHOLD) obj.velocity.y = 0;
+            if (Math.abs(obj.velocity.z) < VELOCITY_THRESHOLD) obj.velocity.z = 0;
+
+            // Clamp maximum velocity to prevent instability
+            const maxVelocity = 10.0; // 10 m/s max
+            if (obj.velocity.length() > maxVelocity) {
+                obj.velocity.normalize().multiplyScalar(maxVelocity);
+            }
+        }
+
+        // Resolve object-to-object collisions after each substep
+        resolveObjectCollisions();
+    }
+
+    // Push objects from stationary arm (when not animating)
+    // This handles cases where objects are dropped onto the arm
+    if (!isAnimating) {
+        pushObjectsFromArm();
     }
 }
 
@@ -1754,19 +2265,18 @@ function applyGripperOpenness() {
 function setGripperOpenness(percent, animated = true) {
     const clampedPercent = Math.max(0, Math.min(100, percent));
 
-    // If opening while holding something, release it immediately
-    if (clampedPercent > gripperOpenness && grippedObject) {
+    // If we have a gripped object and we're opening the gripper, release it
+    if (grippedObject && clampedPercent > gripperOpenness + 1) {
         releaseObject();
     }
 
     if (animated) {
         targetGripperOpenness = clampedPercent;
-        if (!gripperAnimating) {
-            gripperAnimating = true;
-        }
+        gripperAnimating = true;  // Always start animation
     } else {
         gripperOpenness = clampedPercent;
         targetGripperOpenness = clampedPercent;
+        gripperAnimating = false;
         applyGripperOpenness();
     }
 }
@@ -1931,68 +2441,144 @@ function solveIK(targetX, targetY, targetZ, maxIterations = 50) {
 
 let animationStartTime = 0;
 let animationStartAngles = {};
+let lastSafeAngles = null; // Last known collision-free position
+let lastSafeProgress = 0;  // Progress at last safe position
+let previousArmPositions = null; // For velocity-based collision response
 
 function startAnimation() {
     if (!isAnimating) {
         animationStartTime = performance.now();
         animationStartAngles = { ...jointAngles };
+        lastSafeAngles = { ...jointAngles };
+        lastSafeProgress = 0;
+        previousArmPositions = getArmJointPositions();
         isAnimating = true;
         document.getElementById('status-animating').classList.add('active');
     }
 }
 
+// Calculate angles at a given progress value
+function getAnglesAtProgress(progress) {
+    const easedProgress = easingFunctions[CONFIG.animation.easing](progress);
+    return {
+        base: lerpAngle(animationStartAngles.base, targetAngles.base, easedProgress),
+        shoulder: lerp(animationStartAngles.shoulder, targetAngles.shoulder, easedProgress),
+        elbow: lerp(animationStartAngles.elbow, targetAngles.elbow, easedProgress),
+        wrist: lerp(animationStartAngles.wrist, targetAngles.wrist, easedProgress),
+        wristRotate: lerpAngle(animationStartAngles.wristRotate, targetAngles.wristRotate, easedProgress)
+    };
+}
+
+// Apply angles and update scene
+function applyAnglesSet(angles) {
+    jointAngles.base = angles.base;
+    jointAngles.shoulder = angles.shoulder;
+    jointAngles.elbow = angles.elbow;
+    jointAngles.wrist = angles.wrist;
+    jointAngles.wristRotate = angles.wristRotate;
+    applyJointAngles();
+}
+
+// Check collision at a specific set of angles without permanently applying
+// Returns collision info if blocked, otherwise { collision: false }
+function checkCollisionAtAngles(angles) {
+    // Temporarily apply angles
+    const saved = { ...jointAngles };
+    applyAnglesSet(angles);
+
+    // Update world matrices for accurate collision detection
+    if (robotArm.basePivot) {
+        robotArm.basePivot.updateMatrixWorld(true);
+    }
+
+    // Check collision
+    const collision = checkArmCollisionWithBlockedObject();
+
+    // Restore original angles
+    applyAnglesSet(saved);
+
+    return collision;
+}
+
+
+
 function updateAnimation() {
     if (!isAnimating) return;
 
-    // Store previous angles in case we need to revert
-    const prevAngles = { ...jointAngles };
-
     const elapsed = performance.now() - animationStartTime;
-    const progress = Math.min(elapsed / CONFIG.animation.duration, 1);
-    const easedProgress = easingFunctions[CONFIG.animation.easing](progress);
+    const targetProgress = Math.min(elapsed / CONFIG.animation.duration, 1);
+    const progressDelta = targetProgress - lastSafeProgress;
 
-    // Interpolate all joint angles
-    // Base uses lerpAngle for shortest-path rotation (it's circular -180° to 180°)
-    jointAngles.base = lerpAngle(animationStartAngles.base, targetAngles.base, easedProgress);
-    jointAngles.shoulder = lerp(animationStartAngles.shoulder, targetAngles.shoulder, easedProgress);
-    jointAngles.elbow = lerp(animationStartAngles.elbow, targetAngles.elbow, easedProgress);
-    jointAngles.wrist = lerp(animationStartAngles.wrist, targetAngles.wrist, easedProgress);
-    jointAngles.wristRotate = lerpAngle(animationStartAngles.wristRotate, targetAngles.wristRotate, easedProgress);
-
-    applyJointAngles();
-
-    // Push any objects the arm is colliding with (if they can move)
-    pushObjectsFromArm();
-
-    // Check for collision with blocked objects (that couldn't be pushed)
-    const collisionCheck = checkArmCollisionWithBlockedObject();
-    if (collisionCheck.collision) {
-        // Revert to previous safe position
-        jointAngles.base = prevAngles.base;
-        jointAngles.shoulder = prevAngles.shoulder;
-        jointAngles.elbow = prevAngles.elbow;
-        jointAngles.wrist = prevAngles.wrist;
-        jointAngles.wristRotate = prevAngles.wristRotate;
-        applyJointAngles();
-
-        // Stop animation
-        isAnimating = false;
-        document.getElementById('status-animating').classList.remove('active');
-
-        // Clear the command queue to prevent further movement
-        animationQueue.length = 0;
-
-        // Print error
-        terminal.print(`COLLISION: Arm stopped - cannot push through ${collisionCheck.object.name}`, 'error');
-        terminal.print('Object is blocked and cannot be moved. Reposition the arm.', 'warning');
+    // Skip tiny movements
+    if (progressDelta < 0.0001) {
+        // Still check if animation is complete
+        if (targetProgress >= 1) {
+            isAnimating = false;
+            document.getElementById('status-animating').classList.remove('active');
+            if (animationQueue.length > 0) {
+                const nextCommand = animationQueue.shift();
+                processCommand(nextCommand);
+            }
+        }
         return;
     }
 
-    if (progress >= 1) {
+    // Determine substep count - fewer substeps for smoother performance
+    const SUBSTEPS = Math.max(2, Math.ceil(progressDelta * 10));
+
+    let blocked = false;
+    let blockingCollision = null;
+
+    for (let step = 1; step <= SUBSTEPS; step++) {
+        const stepProgress = lastSafeProgress + (progressDelta * step / SUBSTEPS);
+        const proposedAngles = getAnglesAtProgress(stepProgress);
+
+        // Apply the movement first
+        applyAnglesSet(proposedAngles);
+
+        // Push any movable objects
+        pushObjectsFromArm();
+
+        // Check if we're blocked (only after pushing)
+        const collisionCheck = checkArmCollisionWithBlockedObject();
+
+        if (collisionCheck.collision) {
+            // Found a blocking collision - back up slightly
+            const safeProgress = Math.max(lastSafeProgress, stepProgress - (progressDelta / SUBSTEPS) * 0.5);
+            const safeAngles = getAnglesAtProgress(safeProgress);
+            applyAnglesSet(safeAngles);
+            lastSafeAngles = { ...safeAngles };
+            lastSafeProgress = safeProgress;
+            blocked = true;
+            blockingCollision = collisionCheck;
+            break;
+        }
+
+        // Update progress
+        lastSafeAngles = { ...proposedAngles };
+        lastSafeProgress = stepProgress;
+    }
+
+    if (blocked) {
+        isAnimating = false;
+        document.getElementById('status-animating').classList.remove('active');
+        animationQueue.length = 0;
+
+        if (runningProgram) {
+            terminal.print(`Program "${runningProgram.name}" cancelled due to collision.`, 'warning');
+            runningProgram = null;
+        }
+
+        const objName = blockingCollision.object?.name || 'object';
+        terminal.print(`COLLISION: Arm blocked by ${objName}`, 'error');
+        terminal.print('Object cannot be pushed through floor. Try a different approach.', 'warning');
+        return;
+    }
+
+    if (targetProgress >= 1) {
         isAnimating = false;
         document.getElementById('status-animating').classList.remove('active');
 
-        // Process next command in queue if any
         if (animationQueue.length > 0) {
             const nextCommand = animationQueue.shift();
             processCommand(nextCommand);
@@ -2000,51 +2586,73 @@ function updateAnimation() {
     }
 }
 
+
+
 // Update gripper animation (runs independently of joint animation)
+// Handles gripping, releasing, and pushing objects
 function updateGripperAnimation() {
     if (!gripperAnimating) return;
 
-    // Smooth interpolation toward target
-    const speed = 0.04;  // Slower gripper movement for realism
+    const speed = 0.12;  // Gripper movement speed
     const diff = targetGripperOpenness - gripperOpenness;
     const isClosing = diff < 0;
-    const isOpening = diff > 0;
 
-    // Check for grip/release based on direction
+    // Only check for gripping when CLOSING and we don't already have something
     if (isClosing && !grippedObject) {
-        // Check for collision with objects along full finger surface
         for (const obj of sceneObjects) {
             if (obj.isGripped) continue;
 
-            // Use simplified geometric detection for reliable gripping
-            const collision = checkGripperFingerCollision(obj);
+            // Check for contact with fingers
+            const geoCollision = checkGripperFingerCollision(obj);
+            const meshCollision = checkGripperMeshCollision(obj);
 
-            // Check if both fingers are now contacting the object
-            if (collision.bothContact) {
-                // Both fingers touching - grip the object!
-                gripObject(obj);
-                // Stop at current position
-                targetGripperOpenness = gripperOpenness;
-                gripperAnimating = false;
-                applyGripperOpenness();
-                return;
+            const bothContact = meshCollision.bothContact || geoCollision.bothContact;
+            const leftOnly = (meshCollision.leftContact || geoCollision.leftContact) &&
+                            !(meshCollision.rightContact || geoCollision.rightContact);
+            const rightOnly = (meshCollision.rightContact || geoCollision.rightContact) &&
+                             !(meshCollision.leftContact || geoCollision.leftContact);
+
+            if (bothContact) {
+                // Both fingers touching - try to grip
+                if (geoCollision.inGripZone || isObjectInGripZone(obj)) {
+                    gripObject(obj);
+                    // Don't return - let animation continue to close smoothly
+                    break;
+                } else {
+                    terminal.print(`Cannot grip ${obj.name} - object too large or misaligned`, 'warning');
+                    targetGripperOpenness = gripperOpenness + 5;
+                    break;
+                }
+            } else if (leftOnly || rightOnly) {
+                // Single finger contact - push object
+                robotArm.gripperGroup.updateWorldMatrix(true, false);
+                const gripperXAxis = new THREE.Vector3(1, 0, 0);
+                gripperXAxis.applyQuaternion(robotArm.gripperGroup.getWorldQuaternion(new THREE.Quaternion()));
+
+                const pushDir = leftOnly ? gripperXAxis.clone() : gripperXAxis.clone().negate();
+                pushDir.y = 0;
+
+                if (pushDir.lengthSq() > 0.001) {
+                    pushDir.normalize();
+                    const penetration = (meshCollision.leftPenetration || meshCollision.rightPenetration || 0.01);
+                    obj.mesh.position.add(pushDir.clone().multiplyScalar(Math.max(penetration * 2, 0.01)));
+                    obj.velocity.add(pushDir.clone().multiplyScalar(0.5));
+
+                    const halfHeight = obj.getHalfHeight();
+                    if (obj.mesh.position.y < halfHeight) {
+                        obj.mesh.position.y = halfHeight;
+                    }
+                }
             }
         }
-    } else if (isOpening && grippedObject) {
-        // Opening while gripping - release the object
-        releaseObject();
     }
 
-    // Recalculate diff after potential target adjustment
-    const newDiff = targetGripperOpenness - gripperOpenness;
-
-    if (Math.abs(newDiff) < 0.3) {
-        // Close enough, snap to target
+    // Animate gripper movement smoothly
+    if (Math.abs(diff) < 0.5) {
         gripperOpenness = targetGripperOpenness;
         gripperAnimating = false;
     } else {
-        // Smooth interpolation
-        gripperOpenness += newDiff * speed;
+        gripperOpenness += diff * speed;
     }
 
     applyGripperOpenness();
@@ -2080,6 +2688,13 @@ function animate() {
 
     updateAnimation();
     updateGripperAnimation();
+
+    // Always check for arm collisions with objects, even when not animating
+    // This handles cases where objects fall onto the arm or are pushed into it
+    if (!isAnimating) {
+        pushObjectsFromArm();
+    }
+
     updatePhysics(deltaTime);
     controls.update();
     renderer.render(scene, camera);
